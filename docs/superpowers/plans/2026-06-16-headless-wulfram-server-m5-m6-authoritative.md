@@ -302,10 +302,73 @@ functions). On the tick thread, after boot:
 
 ---
 
+## CODEX REVIEW (2026-06-16) — accepted findings + the resolved crux
+
+Codex reviewed this plan. Accepted findings folded in below; the crux changes the control model.
+
+### CRUX RESOLVED — the local-input channel is single-player; remote players must be per-entity
+RE answer (verified): `Input_UpdateAnalogControlSliders @ 0x441e20` takes **no entity arg** — it reads
+global slider singletons and calls `Sync_SetChannelTarget @ 0x45ca30`, which writes the **global**
+channel-table singletons (`DAT_00678f44`/`DAT_00678f9c`/`DAT_00678eec`) indexed by channel id only.
+No entity pointer anywhere on that path, and the binary (a CLIENT) has **no `Net_HandleActionUpdate`**
+— it only SENDS `ACTION_UPDATE` and only drives the ONE local player. Routing N players through the
+channel bus would collapse them onto one entity (last write wins). **Do NOT use the local-input
+channel as a multi-tenant API.**
+- **Adopted model:** the engine authoritatively simulates ALL entities in the world list; for each
+  remote player's tank we inject control state **per-entity** onto its OWN physics/control object
+  (per-entity tuning/control struct around `entity+0x48`/`+0x4c`, physics `@ +0xBC`), NOT via the
+  global channels; then `EntityPhysics_RunWorldTick` integrates all of them. Local-channel path is
+  used for at most one optional server-local slot, or not at all.
+- **M5.0b (NEW, do FIRST, READ-ONLY):** pin the exact per-entity control fields — how a NON-LOCAL
+  tank's throttle/turn/strafe reach its physics object so `IntegrateStep` produces motion (trace the
+  active-vehicle control-apply in `RunWorldTick`'s per-entity branch / around `Vehicle_UpdateThrustFx`,
+  reading `entity+0x48`/`+0x4c`/`+0xBC`). Raw accumulator writes (+0x24/+0x48) are a last-resort shim
+  only (transient, zeroed each tick, bypass gameplay logic).
+
+### Resequencing (accepted): prove control injection CHEAPLY before the socket server
+New order: **M5.3 SEH first** (crash diag) → **M5.4-min** (boot → `Game_ResetSession` →
+`Client_SetCurrentWorld` → spawn ONE entity → run 10 ticks → confirm predictable motion) →
+**M5.2-min** (inject control for that one non-local entity, confirm physics integrates it, read it)
+→ THEN build **M5.1b** socket server at scale → M6.1 relay → M6.2 tooling. M5.1a stands; M5.1b's
+engine-less socket code is unaffected by the crux (its bridge just isn't wired until M5.2-min proves
+the control path).
+
+### Timing contract (accepted, MAJOR)
+Stamp each validated command with a sim-tick/seq on arrival; drain the IncomingCmdQueue EXACTLY once
+per tick at a fixed PRE-physics point on the engine thread; snapshot for relay ONLY AFTER
+`Interp_StepSimulationSubsteps`/`RunWorldTick` returns and accumulator zeroing is done (gate with an
+explicit post-tick flag). A net thread MUST NEVER read engine memory for any purpose.
+
+### Engine interference (accepted, MAJOR)
+The engine's own client net (`Net_ServiceConnection 0x46b830`, `DAT_005f3844`, `DAT_006782e4`) is
+still live and could open sockets / contend on our port / re-enter world state. STUB/NO-OP the native
+connect + `Net_ServiceConnection` at inject time. Audit `SetTimer`/`WM_TIMER`/`timeSetEvent` so the
+only code walking the world list / physics is OUR tick seam.
+
+### Bit-perfect hazards beyond the 5 (accepted, MAJOR)
+- **x87 control word:** set/restore the engine's FPU precision+rounding mode on the tick thread (match
+  the `_controlfp` the engine set in init); verify with a known-value vector.
+- **fixed16.16 rounding:** implement identical to the engine's assembly at the quant site (don't assume
+  `lround`); negative/halfway values are FPU-rounding-mode dependent.
+- **dt source:** confirm whether `RunWorldTick`/`IntegrateStep` reads its own timer (timeGetTime/QPC)
+  or takes a dt arg; if self-timed, Sleep-pacing → cross-machine non-determinism; if arg, pass fixed dt.
+- **collision iteration order:** `CollisionContact_ResolveAll` is sensitive to world-list insertion
+  order — enforce canonical spawn order (map objects by file order → players by join order → missiles
+  by fire order); never hash/pointer iteration for physics.
+- **read after tick only** (timing contract).
+
+### Missing (accepted)
+Per-opcode reliability: create(0x18)/destroy(0x15) reliable (TCP); pos/state (0x0E/0x0F) unreliable
+(UDP). Document clock-drift (0x2F) handling, reconnection, and whether UDP `[seq]` is passthrough/
+echoed/synthesized by us. DEFER per-client interest/visibility scoping (broadcast-to-all first).
+
+### MINOR
+Session-key echo is trust-the-echo (no crypto); UDP source-IP binding is the only mitigation (none
+behind NAT). Acceptable for LAN/trusted; document the threat model for internet use.
+
 ## Risks / notes
-- Resident dispatch table is the CLIENT handler set (it RECEIVES spawns/snapshots). To act as the
-  server we register a server-side handler subset (LOGIN/HELLO/ACTION inbound) or hand-drive; prefer
-  reusing engine readers to keep parsing bit-perfect.
-- "Current player" singletons (`DAT_00677f2c`) assume one local player; multi-client needs care so
-  per-peer state does not collide with the resident client-singleton assumptions (audit in M6/M7).
+- Resident dispatch table is the CLIENT handler set (RECEIVES spawns/snapshots) and has NO server-side
+  action-apply — we drive per-entity control directly (see crux above).
+- "Current player" singletons (`DAT_00677f2c`/`DAT_005b83e0`/the channel bus) assume one local player;
+  remote players are NON-LOCAL entities, never routed through those singletons.
 - Keep M3/M4 verified behavior (headless boot, hidden window, paced tick) — do not regress.
