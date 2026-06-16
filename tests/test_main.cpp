@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -27,6 +28,12 @@ std::string ReadAll(const std::filesystem::path& p) {
     return ss.str();
 }
 
+void WriteBytes(const std::filesystem::path& p, const std::vector<unsigned char>& bytes) {
+    std::ofstream out(p, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()),  // NOLINT
+              static_cast<std::streamsize>(bytes.size()));
+}
+
 }  // namespace
 
 TEST(Config, ParseLogLevel) {
@@ -37,6 +44,11 @@ TEST(Config, ParseLogLevel) {
     EXPECT_EQ(wfh::ParseLogLevel("[server]\nbind_port = 2627\n"),
               wfh::Level::Debug);                                           // no level line
     EXPECT_EQ(wfh::ParseLogLevel("level = \"bogus\""), wfh::Level::Debug);  // unrecognized
+    // Keys that merely *contain* "level" must not be treated as the level line.
+    EXPECT_EQ(wfh::ParseLogLevel("noise_level = \"loud\"\n[log]\nlevel = \"warn\""),
+              wfh::Level::Warn);
+    // A comment/value containing a level word must not mis-fire; only the real key counts.
+    EXPECT_EQ(wfh::ParseLogLevel("# set the error budget\nlevel = \"info\""), wfh::Level::Info);
 }
 
 TEST(LogTest, WritesToFileAndRespectsLevel) {
@@ -91,6 +103,106 @@ TEST(LoaderArgs, RequiresExe) {
     std::vector<std::wstring> argv = {L"loader.exe"};
     const auto r = wfh::ParseLoaderArgs(argv);
     EXPECT_FALSE(r.ok);
+}
+
+TEST(PeValidate, ReadPeHeaderFactsRejectsMalformed) {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "wfh_pe_malformed_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    // Builds a well-formed PE32 image (e_lfanew=0x80) we can mutate per case.
+    auto make_good = []() -> std::vector<unsigned char> {
+        std::vector<unsigned char> buf(0x200, 0);
+        buf[0] = 'M';
+        buf[1] = 'Z';
+        const std::uint32_t e_lfanew = 0x80;
+        std::memcpy(&buf[0x3C], &e_lfanew, 4);
+        buf[0x80] = 'P';
+        buf[0x81] = 'E';                       // "PE\0\0" at e_lfanew
+        const std::uint16_t machine = 0x014C;  // I386
+        std::memcpy(&buf[0x84], &machine, 2);
+        const std::uint16_t nsect = 1;
+        std::memcpy(&buf[0x86], &nsect, 2);
+        const std::uint32_t stamp = 0x11223344;
+        std::memcpy(&buf[0x88], &stamp, 4);
+        const std::uint16_t optsize = 0xE0;  // SizeOfOptionalHeader
+        std::memcpy(&buf[0x94], &optsize, 2);
+        const std::uint16_t magic = 0x010B;  // PE32 optional-header magic
+        std::memcpy(&buf[0x98], &magic, 2);
+        const std::uint32_t image_base = 0x00400000;
+        std::memcpy(&buf[0x80 + 24 + 28], &image_base, 4);
+        const std::uint32_t size_of_image = 0x00300000;
+        std::memcpy(&buf[0x80 + 24 + 56], &size_of_image, 4);
+        const std::uint32_t check_sum = 0x000ABCDE;
+        std::memcpy(&buf[0x80 + 24 + 64], &check_sum, 4);
+        return buf;
+    };
+
+    // (a) too small: fewer bytes than sizeof(IMAGE_DOS_HEADER).
+    {
+        const auto p = dir / "too_small";
+        WriteBytes(p, std::vector<unsigned char>(8, 0));
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // (b) no "MZ" magic.
+    {
+        auto buf = make_good();
+        buf[0] = 'X';
+        buf[1] = 'Y';
+        const auto p = dir / "no_mz";
+        WriteBytes(p, buf);
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // (c) negative e_lfanew.
+    {
+        auto buf = make_good();
+        const std::uint32_t neg = 0xFFFFFFF0u;  // -16 as signed LONG
+        std::memcpy(&buf[0x3C], &neg, 4);
+        const auto p = dir / "neg_lfanew";
+        WriteBytes(p, buf);
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // (d) e_lfanew pointing past EOF.
+    {
+        auto buf = make_good();
+        const std::uint32_t past = 0x10000;  // far beyond 0x200-byte file
+        std::memcpy(&buf[0x3C], &past, 4);
+        const auto p = dir / "lfanew_past_eof";
+        WriteBytes(p, buf);
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // (e) "MZ" + valid e_lfanew but no "PE\0\0" signature there.
+    {
+        auto buf = make_good();
+        buf[0x80] = 'N';
+        buf[0x81] = 'O';
+        const auto p = dir / "no_pe_sig";
+        WriteBytes(p, buf);
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // (f) PE with Machine != I386 (x86-64).
+    {
+        auto buf = make_good();
+        const std::uint16_t machine = 0x8664;  // AMD64
+        std::memcpy(&buf[0x84], &machine, 2);
+        const auto p = dir / "wrong_machine";
+        WriteBytes(p, buf);
+        EXPECT_FALSE(wfh::ReadPeHeaderFacts(p).ok);
+    }
+    // Positive: minimal well-formed PE32 yields .ok with the expected stamps.
+    {
+        const auto p = dir / "good";
+        WriteBytes(p, make_good());
+        const auto r = wfh::ReadPeHeaderFacts(p);
+        ASSERT_TRUE(r.ok);
+        EXPECT_EQ(r.facts.time_date_stamp, 0x11223344u);
+        EXPECT_EQ(r.facts.image_base, 0x00400000u);
+        EXPECT_EQ(r.facts.size_of_image, 0x00300000u);
+        EXPECT_EQ(r.facts.check_sum, 0x000ABCDEu);
+    }
+
+    fs::remove_all(dir);
 }
 
 TEST(PeValidate, ValidateHeadersMatchAndMismatch) {

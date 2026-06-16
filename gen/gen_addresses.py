@@ -116,10 +116,15 @@ def emit_manifest(out_dir, stamps, hook_bytes):
     # Hook-site byte capture is deferred (Task: later). For now, and whenever
     # --hook-bytes is 0, the manifest carries no per-site byte signatures.
     if hook_bytes and hook_bytes > 0:
-        # TODO(later task): capture opening bytes at each hook site from the PE.
-        # Until then this path is a no-op that emits zero sites, never crashes.
+        # TODO(later task): capture opening bytes at each hook site from the PE and
+        # emit them as `inline constexpr HookSite kSites[] = {...}` (a single
+        # definition shared across TUs, matching kBinaryManifest below). Until then
+        # this path is a documented no-op that emits zero sites and never crashes.
         eprint(f"note: --hook-bytes {hook_bytes} not implemented yet; emitting 0 sites")
-    lines.append("static constexpr const HookSite* kSites = nullptr;\n")
+    # `inline constexpr` (not `static constexpr`): `static` at namespace scope gives
+    # every translation unit its own copy of the symbol; `inline` yields a single
+    # shared definition across TUs, matching kBinaryManifest below.
+    lines.append("inline constexpr const HookSite* kSites = nullptr;\n")
     lines.append(
         "inline constexpr BinaryManifest kBinaryManifest{"
         f" 0x{time_date_stamp:08x}, 0x{size_of_image:08x},"

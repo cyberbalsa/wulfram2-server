@@ -7,7 +7,7 @@
 
 namespace wfh {
 
-static constexpr const HookSite* kSites = nullptr;
+inline constexpr const HookSite* kSites = nullptr;
 inline constexpr BinaryManifest kBinaryManifest{0x45254d1f, 0x00288000, 0x001c45a4,
                                                 0x00400000, kSites,     0};
 

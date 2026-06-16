@@ -36,6 +36,10 @@ constexpr auto kWorkerPollInterval = std::chrono::milliseconds(50);
 constexpr std::size_t kBodyBufferSize = 1024;
 constexpr std::size_t kHeadBufferSize = 256;
 
+// No destructor by design (see S() and the note below): the special-member rule
+// flags the missing destructor alongside the deleted copy/move, but a destructor
+// is exactly what must not exist here.
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 struct State {
     std::ofstream file;
     std::mutex mutex;
@@ -49,17 +53,14 @@ struct State {
 
     State() = default;
 
-    // Safe teardown if Shutdown() was never called (e.g. injected-DLL path that
-    // runs for the whole process lifetime). Destroying a still-joinable
-    // std::thread triggers std::terminate(); stop the worker first. Cooperates
-    // with Shutdown(): if Shutdown already ran, worker is no longer joinable.
-    ~State() {
-        running.store(false);
-        cv.notify_all();
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
+    // No destructor: State is an intentionally-leaked process-lifetime singleton
+    // (see S()), so ~State() must never run. On the injected-DLL success path the
+    // logger is never Shutdown(), so a destructor here would run during CRT/static
+    // teardown near the loader lock, where worker.join() can deadlock the host
+    // process on exit. The explicit Shutdown() path (running.exchange(false) +
+    // notify + join) is the only clean stop; if it is never called the worker
+    // thread is simply reclaimed by the OS at process exit. Because State is never
+    // destroyed, the worker can never touch a freed mutex/queue/file either.
 
     // State is a process-lifetime singleton (see S()); it is never copied or moved.
     State(const State&) = delete;
@@ -68,9 +69,15 @@ struct State {
     auto operator=(State&&) -> State& = delete;
 };
 
+// Intentionally-leaked singleton: the State is heap-allocated and never deleted so
+// its destructor NEVER runs at process/static teardown. This avoids a worker.join()
+// hang near the loader lock when the injected DLL never calls Shutdown(). The leak
+// is by design and bounded (one State for the process lifetime), so the owning-memory
+// (no matching delete) and use-auto checks are suppressed on the deliberate new.
 auto S() -> State& {
-    static State state;
-    return state;
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,modernize-use-auto)
+    static State* const state = new State();  // intentionally leaked; ~State never runs
+    return *state;
 }
 
 void DrainOnce(State& state) {

@@ -31,3 +31,6 @@ def test_generates_headers(tmp_path):
     assert "0x004a0aa0" in addr and "client_runmainloop" in addr
     manifest = (out / "binary_manifest.h").read_text().lower()
     assert "0x11223344" in manifest and "0x00300000" in manifest and "kbinarymanifest" in manifest
+    # kSites must be a single cross-TU definition (inline constexpr), not per-TU static.
+    assert "inline constexpr const hooksite* ksites = nullptr;" in manifest
+    assert "static constexpr const hooksite* ksites" not in manifest
