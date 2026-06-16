@@ -37,7 +37,9 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
       10/10 ctest, lint PASS. **Codex-reviewed.**
 - Note: **reordered Task 5 (generator) before Task 4 (injector)** — injector.cpp includes the
       generated `binary_manifest.h`, so the generator must run first to keep the gate green.
-- [ ] **Task 4** — Injector + loader main
+- [x] **Task 4** — Injector (suspended-launch + binary-pinning gate + LoadLibraryW remote-thread) + loader main.
+      Commits `f3c182e`, `b7e7160` (Codex-hardened: 15s wait timeout, TOCTOU read-lock across spawn, checked
+      ResumeThread/GetExitCodeThread/GetModuleHandle). 12/12 ctest, lint PASS. **Codex-reviewed.**
 - [x] **Task 5** — `gen_addresses.py` + pytest; generated `addresses.h` (17 consts) + `binary_manifest.h`
       with real `wulfram2.exe` stamps (stamp `0x45254d1f`, size `0x288000`, sum `0x1c45a4`, base `0x400000`).
       gtest static-asserts the headers. Commit `20d1448`. 11/11 ctest.
