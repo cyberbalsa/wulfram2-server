@@ -1,0 +1,17 @@
+Client_RunMainLoop
+App_RunGameAndExit
+Net_InitAccept
+Net_InitMultiUdpIpAccept
+Net_InitAcceptSocket
+Render_InitDriverAndViewports
+Winsys_D3D_Init
+Winsys_D3D_InitDevice
+Winsys_DX_Init
+Winsys_GDI_Init
+Winsys_InitGlideRenderer
+DirectDraw_InitAndSetCooperativeLevel
+DirectInput_InitMouse
+DirectInput_InitJoystick
+Winsys_Input_InitWin32State
+Snd_InitDevice
+Voice_InitSystem

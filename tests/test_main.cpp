@@ -2,6 +2,10 @@
 #include "wfh/log.hpp"
 #include "wfh/pe_validate.hpp"
 
+// Generated headers (gen/) — proves they compile and carry the right values.
+#include "addresses.h"
+#include "binary_manifest.h"
+
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -128,6 +132,19 @@ TEST(PeValidate, HookSitesReadableMismatch) {
     const auto r = wfh::ValidateHookSitesInProcess(m);
     EXPECT_FALSE(r.ok);
     EXPECT_NE(r.error.find("mismatch"), std::string::npos);
+}
+
+TEST(GeneratedHeaders, AddressesAndManifestAreSane) {
+    // gen/addresses.h constants compile and carry the curated W2VULK values.
+    static_assert(wfh::addr::Client_RunMainLoop == 0x004a0aa0u, "address drift");
+    static_assert(wfh::addr::Snd_InitDevice == 0x00489fb0u, "address drift");
+    static_assert(wfh::addr::Voice_InitSystem == 0x0048b680u, "address drift");
+    // gen/binary_manifest.h: real wulfram2.exe identity. Image base is fixed.
+    EXPECT_EQ(wfh::kBinaryManifest.image_base, 0x00400000u);
+    EXPECT_EQ(wfh::kBinaryManifest.site_count, 0u);
+    EXPECT_EQ(wfh::kBinaryManifest.sites, nullptr);
+    EXPECT_NE(wfh::kBinaryManifest.time_date_stamp, 0u);
+    EXPECT_NE(wfh::kBinaryManifest.size_of_image, 0u);
 }
 
 TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {

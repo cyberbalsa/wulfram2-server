@@ -1,0 +1,17 @@
+Client_RunMainLoop	0x004a0aa0
+App_RunGameAndExit	0x004a0b70
+Net_InitAccept	0x00507ff0
+Net_InitMultiUdpIpAccept	0x00507ee0
+Net_InitAcceptSocket	0x00507810
+Render_InitDriverAndViewports	0x00485b20
+Winsys_D3D_Init	0x004a8880
+Winsys_D3D_InitDevice	0x004a8280
+Winsys_DX_Init	0x004b3190
+Winsys_GDI_Init	0x004b5270
+Winsys_InitGlideRenderer	0x004b8850
+DirectDraw_InitAndSetCooperativeLevel	0x004b23a0
+DirectInput_InitMouse	0x004b15b0
+DirectInput_InitJoystick	0x004b1b50
+Winsys_Input_InitWin32State	0x004b7b50
+Snd_InitDevice	0x00489fb0
+Voice_InitSystem	0x0048b680
