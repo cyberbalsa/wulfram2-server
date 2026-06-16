@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -97,4 +98,43 @@ TEST(PeValidate, CompareBytesMatchAndMismatch) {
     const std::uint8_t expect_bad[] = {0x55, 0x90, 0xEC};
     EXPECT_TRUE(wfh::CompareBytes(mem, expect_ok, 3).ok);
     EXPECT_FALSE(wfh::CompareBytes(mem, expect_bad, 3).ok);
+}
+
+TEST(PeValidate, CompareBytesEdgeCases) {
+    const std::uint8_t a[] = {1, 2, 3};
+    const std::uint8_t b[] = {1, 2, 3};
+    EXPECT_TRUE(wfh::CompareBytes(a, b, 3).ok);
+    EXPECT_TRUE(wfh::CompareBytes(nullptr, nullptr, 0).ok);  // zero length: trivially equal
+    EXPECT_FALSE(wfh::CompareBytes(nullptr, b, 3).ok);       // null actual: clean fail, no UB
+    EXPECT_FALSE(wfh::CompareBytes(a, nullptr, 3).ok);       // null expected: clean fail, no UB
+}
+
+TEST(PeValidate, HookSitesReadableMatch) {
+    static const std::uint8_t kBuf[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    wfh::HookSite site{"buf", static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(kBuf)),
+                       kBuf, 4};
+    wfh::BinaryManifest m{0, 0, 0, 0, &site, 1};
+    EXPECT_TRUE(wfh::ValidateHookSitesInProcess(m).ok);
+}
+
+TEST(PeValidate, HookSitesReadableMismatch) {
+    static const std::uint8_t kBuf[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    static const std::uint8_t kWrong[] = {0x00, 0x00, 0x00, 0x00};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    wfh::HookSite site{"buf", static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(kBuf)),
+                       kWrong, 4};
+    wfh::BinaryManifest m{0, 0, 0, 0, &site, 1};
+    const auto r = wfh::ValidateHookSitesInProcess(m);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("mismatch"), std::string::npos);
+}
+
+TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {
+    static const std::uint8_t kExpect[] = {0x00};
+    wfh::HookSite site{"bogus", 0x1u, kExpect, 4};  // 0x1 is not a committed readable page
+    wfh::BinaryManifest m{0, 0, 0, 0, &site, 1};
+    const auto r = wfh::ValidateHookSitesInProcess(m);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("unreadable"), std::string::npos);  // must NOT fault the process
 }
