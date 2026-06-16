@@ -111,15 +111,51 @@ BIRTH_NOTICE; per-tick 0x0F (self) / 0x0E (others) carry motion.
   trust-the-echo round trip. BEHAVIOR(0x24) field counts are positional. TRANSLATION(0x32) must
   precede movement decode. UDP↔TCP linkage = correlate the UDP source by the echoed key.
 
-### Two ways to be the server (DECISION NEEDED — see below)
-- **(A) In-binary accept bridge:** `Net_InitAccept` 0x507ff0 + `Net_FindOrCreatePeer` + reuse the
-  engine's own send/recv. Maximal reuse of engine framing, but the resident handler table is the
-  CLIENT set; we'd register/drive server-side handling.
-- **(B) Independent socket server in the DLL** that speaks the (now-known, proven) framing
-  directly (port the Python protocol to C++), and uses the in-process engine purely as the
-  **bit-perfect physics oracle** (feed inputs → run engine tick → read entity structs → emit
-  state). Cleanest separation; the protocol is already proven in Python.
-- **(C) Inject inbound packets into the client receive path** via `Proto_DispatchPacket` 0x509f70.
+### DECISION (user, 2026-06-16): **(B) Independent DLL socket server + engine as physics oracle**
+Rationale (user): port the proven protocol but with **modern (2026) client handling** —
+real multithreading, proper per-connection state machines — and **hardening against bad/hostile
+data** (the 2006 binary has no such validation). Clean separation puts the untrusted network on
+one side of a boundary and the (non-thread-safe) engine memory on the other.
+
+Rejected: (A) in-binary accept bridge (couples us to the client handler table + the engine's
+single-threaded send path); (C) inject into `Proto_DispatchPacket` (testing aid only).
+
+#### Threading model (NON-NEGOTIABLE constraint)
+The engine + all its memory (entity structs, OidTable, `Net_*`, `Obj_*`) are **single-threaded and
+NOT thread-safe**. Therefore:
+- **Network I/O threads** (accept loop + per-connection or async recv): own the sockets, do all
+  blocking/`select`/`recv`, parse + VALIDATE untrusted bytes into plain POD command structs. They
+  NEVER touch engine memory.
+- **Engine tick thread** (the existing `Client_RenderFrame` tick seam): the ONLY thread that calls
+  `Obj_Create`/`Obj_DestroyById`, reads entity structs, runs the engine sim, and builds outbound
+  state. 
+- **Boundary:** lock-protected (or lock-free) queues. Inbound: net thread → `IncomingCmdQueue`
+  (validated commands: connect/login/action/reincarnate) → drained by the tick thread. Outbound:
+  tick thread snapshots authoritative entity state → `OutboundStateQueue` → net threads serialize
+  + send per connection. No engine pointer ever crosses to a net thread (snapshots are by value).
+
+#### Security / hardening posture (the "bad data" requirement)
+All inbound parsing treats bytes as hostile:
+- Strict bounds: every read checks remaining length; the bit reader clamps; reject (drop the
+  connection) on under/overflow rather than UB. Cap packet size (`u16` framing already bounds it);
+  cap per-tick packets/bytes per connection (flood control).
+- Validate every field against engine-valid ranges BEFORE it can reach the engine: opcode in the
+  known set; unit_type 0..N; oid ownership (a client may only drive ITS own entity — owner check
+  against the session, closing trap "any client moves any actor"); action channel ids/values
+  clamped to [-1,1]; string lengths bounded + NUL-terminated.
+- Per-connection state machine: reject packets out of handshake order (no ACTION before VERIFIED).
+- Session/auth: bind UDP endpoint to TCP session via the key echo (as the proven flow does);
+  do not trust client-asserted player_id/oid.
+- The engine tick is SEH-guarded (M5.3) so even a validation miss faults safely, not silently.
+
+#### Module layout (new, under src/dll/server/)
+- `net/` — sockets, accept loop, per-connection state machine, framing (TCP `[u16][op][bits]`,
+  UDP `[seq][op][bits]`), bit reader/writer (MSB-first), strict validators.
+- `proto/` — packet encode/decode for the opcodes in the bring-up table; TRANSLATION-table-driven
+  quantization captured from the engine.
+- `bridge/` — the two queues + the tick-thread drain/apply + state-snapshot; the ONLY code that
+  calls engine functions/reads structs.
+- Reuse `wfh_log`; new code is /W4 /WX + clang-tidy + cppcheck clean like the rest.
 
 ## M5.0 entity data contract (verified — struct 0x170, world list, codec)
 
@@ -157,6 +193,30 @@ These 5 are the reimplementation traps the bit-perfect (engine-runs-the-math) de
 
 ---
 
+## Scope: the server owns the FULL world state (not just per-player tanks)
+
+Authoritative state is **every interacting object**: tanks, base objects (repair/build pads,
+generators, turrets, team structures), missiles/projectiles, cargo boxes, flares/FX entities — all
+of them, because they interact (weapons hit tanks, missiles track + collide, tanks collide with
+terrain/bases, cargo pickup, base capture/power). This is exactly why engine-as-authority is right
+and a from-scratch sim is not:
+
+- `EntityPhysics_RunWorldTick @ 0x4f8550` already iterates the WHOLE world list (`DAT_006785e4`) and
+  `CollisionContact_ResolveAll` resolves all inter-object contacts every tick. We do NOT reimplement
+  object↔object interaction — the engine does it across the full set.
+- Server world-state job: keep the engine's world list populated + authoritative (map/base objects
+  at load; player tanks on join; missiles when weapons fire), let the engine tick advance + collide
+  ALL of them, then replicate the FULL set (create/update/destroy) to every client. Short-lived
+  entities (missiles): relay create on spawn, deltas while alive, destroy on detonation/expiry.
+- Mechanism: iterate `DAT_006785e4` each tick (every object, type at +0x08), diff vs last-sent
+  per client, emit create/update/destroy. Map/base objects come from the map `state` file (the
+  proven Python `/s loadmap` populated repair pads + base units — same data → `Obj_Create`).
+- Weapons/missiles: a client fire input → server spawns a projectile entity (engine spawn) → engine
+  integrates + collides it like everything else → hits damage the target's +0xD0 health. (Weapon RE
+  detail = M7; M6 establishes the full-world replication path that carries them.)
+
+---
+
 ## Tasks
 
 ### M5.0 — RE: finalize the entity physics-field offsets + the inbound action-apply path (READ-ONLY)
@@ -166,37 +226,48 @@ These 5 are the reimplementation traps the bit-perfect (engine-runs-the-math) de
   @ 0x441e20` channel path. Report the call to set channel N for entity E so `RunWorldTick` integrates it.
 - Report only. No code.
 
-### M5.1 — Multi-client accept bridge
-- Per-tick pump seam: the `Client_RenderFrame` detour (runs every loop iteration) is the natural
-  hook — after pacing, call our `ServerTick()` (accept new peers, pump each peer's recv, run relay).
-- Stand up the game listener: `Net_InitAccept(mgr, 1, tcp_port)` (+ UDP type 2 as needed); mgr =
-  `DAT_006782e0` or a fresh `operator_new(0x4c)`. Accept readable sockets → `Net_FindOrCreatePeer`
-  → keep a peer list (our own std::vector).
-- Per new peer: drive the HELLO handshake (version 0x4e89) + LOGIN using `Net_SendStart`/`Proto_FinishPacket`.
-- Verify: two clients can establish a connection (or a loopback self-connect) without crashing;
-  the existing single-connection path still works. SEH-guard the per-peer parse (see M5.3).
+### M5.1a — Bit reader/writer + framing + validators (pure, UNIT-TESTED, no engine, no sockets)
+- MSB-first bit reader/writer (matches the engine + Python `streams.py`), TCP `[u16_be len][op][bits]`
+  and UDP `[seq][op][bits]` framing, `WriteString`/`ReadString` (`[u16 len-incl-NUL][bytes+NUL]`),
+  fixed-16.16 helpers. Reader is **bounds-checked & fuzz-safe**: every read returns ok/fail, never UB.
+- Validators: opcode whitelist, length caps, field-range clamps, string-length bounds.
+- These are plain C++ (gtest-able on the host build) — highest-value to TDD first, zero engine risk.
+- Verify: gtest round-trips + adversarial/truncated-input tests (no crash, clean reject).
 
-### M5.2 — Action ingest (bit-perfect input→sim)
-- Parse each peer's inbound ACTION_UPDATE/ACTION_DUMP (reuse the engine's MemBuf/stream readers),
-  and apply the channel values to THAT peer's server-side entity via the engine's action path so the
-  next `EntityPhysics_RunWorldTick` integrates them. No hand-rolled physics.
-- Verify: a client's inputs move its server-side entity; positions read from the struct match the
-  client's local prediction (bit-perfect parity check).
+### M5.1b — Threaded socket server + per-connection state machine (no engine yet)
+- WinSock2 listener (TCP, + UDP gameplay) on the configured port; an accept/I/O thread model
+  (thread-per-connection or `select`-based — pick simplest robust). Per-connection state machine
+  drives the proven bring-up order; rejects out-of-order packets.
+- Inbound parsed+validated → `IncomingCmdQueue` (POD commands). Outbound `OutboundStateQueue` →
+  serialized + sent. NO engine calls on these threads.
+- Verify: a real wulfram2 client (or a test harness) completes HELLO/LOGIN to VERIFIED against a
+  stubbed (engine-less) state source; malformed/hostile inputs are rejected without crashing.
 
-### M6.1 — Authoritative relay (bit-perfect output)
-- Each tick: gather changed entities (dirty), broadcast 0x0e UpdateArray (+0x18 create/0x15 destroy)
-  to every peer via the engine's serializer. Use HARD_SYNC bit to correct lagged clients.
-- Verify: client B sees client A's tank move authoritatively; a lagged client snaps back on hard-sync.
+### M5.2 — Bridge: drain queue on the tick thread, apply via the engine (bit-perfect input→sim)
+- On the engine tick thread (the `Client_RenderFrame` seam), drain `IncomingCmdQueue`: map each
+  validated ACTION command to the engine's action-channel apply for THAT session's entity (with
+  owner check) so the next `EntityPhysics_RunWorldTick` integrates it. No hand-rolled physics.
+- Verify: a client's inputs move its server-side entity; struct-read positions match the client's
+  local prediction (bit-perfect parity).
+
+### M6.1 — Authoritative relay of the FULL world (bit-perfect output)
+- On the tick thread, snapshot the WHOLE world list (`DAT_006785e4` — tanks, base objects, missiles,
+  cargo, …; by value) → `OutboundStateQueue`. Maintain per-connection last-sent state; diff to emit
+  0x18 create (new objects incl. just-spawned missiles), 0x0E UpdateArray (moved/changed), 0x15
+  destroy (detonated/expired/removed) using the captured TRANSLATION-table quantization. New joiners
+  get a full 0x0F snapshot of every object. HARD_SYNC bit corrects lagged clients.
+- Verify: client B sees client A's tank AND base objects AND a fired missile, all authoritative;
+  a lagged client snaps back on hard-sync; a destroyed object disappears on all clients.
 
 ### M6.2 — Actor tooling
-- In-process spawn/move/destroy: `Obj_Create`+`Obj_InitFromSpawn` / `Interp_SetEntityPositionAndRederive`
-  / `Obj_DestroyById`. Expose via a simple command/control surface. These replicate via M6.1.
+- Tick-thread spawn/move/destroy: `Obj_Create`+`Obj_InitFromSpawn` / `Interp_SetEntityPositionAndRederive`
+  / `Obj_DestroyById`, fed from a control command channel. These replicate via M6.1.
 - Verify: a tool-spawned actor appears on all clients and can be moved/destroyed.
 
 ### M5.3 — SEH boundary (carry over from M4.3, now load-bearing)
-- Wrap per-tick + per-peer-parse engine calls in `__try/__except`: on fault, log code/addr +
-  breadcrumb + MiniDumpWriteDump (dbghelp linked), terminate cleanly. Untrusted client packets make
-  this mandatory.
+- Wrap the per-tick engine calls (queue drain + sim + snapshot) in `__try/__except`: on fault, log
+  code/addr + breadcrumb (tick#, last cmd) + MiniDumpWriteDump (dbghelp linked), terminate cleanly.
+  Untrusted client input crossing into the engine makes this mandatory.
 
 ---
 
