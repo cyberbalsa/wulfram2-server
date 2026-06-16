@@ -219,9 +219,11 @@ Connection::Connection(std::uint64_t session_id, ServerConfig cfg, std::string s
 
 auto Connection::OnAccept() -> std::vector<std::uint8_t> {
     std::vector<std::uint8_t> out;
-    // Proven order: UDP_CONFIG -> VERSION -> SESSION_KEY, then wait for the UDP echo.
+    // Mirror the proven Python bootstrap exactly: UDP_CONFIG -> SESSION_KEY, then
+    // wait for the UDP key echo. VERSION (HELLO sub 0) is a client->server packet;
+    // echoing it back here stalls the real client before it sends the key echo
+    // (the engine self-connection never linked its UDP until this was removed).
     Append(out, BuildHelloUdpConfig(cfg_.bind_port, cfg_.advertised_udp_host));
-    Append(out, BuildHelloVersion());
     Append(out, BuildHelloSessionKey(session_key_));
     WFH_DEBUG("conn", "session %llu accept burst queued bytes=%zu",
               static_cast<unsigned long long>(session_id_), out.size());

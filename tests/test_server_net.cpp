@@ -462,6 +462,33 @@ TEST(WorldPackets, SpawnResultPacketsMatchPythonReferenceShapes) {
 
 // --- Connection state machine ----------------------------------------------
 
+// The accept burst must mirror the proven Python handshake: UDP_CONFIG (sub 1)
+// then SESSION_KEY (sub 2), with NO server-sent VERSION (sub 0). VERSION is a
+// client->server packet; sending it back stalls the real client before it echoes
+// the session key over UDP, so the engine self-connection never links.
+TEST(Connection, AcceptBurstIsUdpConfigThenSessionKeyNoVersion) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+
+    const auto hello = conn.OnAccept();
+
+    std::vector<std::uint8_t> hello_subcmds;
+    TcpFrameAccumulator acc;
+    ASSERT_TRUE(acc.Feed(hello.data(), hello.size()));
+    while (auto frame = acc.Next()) {
+        if (frame->opcode != static_cast<std::uint8_t>(Opcode::Hello)) {
+            continue;
+        }
+        BitReader r(frame->body.data(), frame->body.size());
+        const auto sub = r.ReadByte();
+        ASSERT_TRUE(sub.has_value());
+        hello_subcmds.push_back(*sub);
+    }
+
+    EXPECT_EQ(hello_subcmds, (std::vector<std::uint8_t>{0x01, 0x02}));
+}
+
 // Drive a connection through the full proven order and assert it reaches Verified.
 TEST(Connection, HappyPathReachesVerified) {
     ServerConfig cfg;

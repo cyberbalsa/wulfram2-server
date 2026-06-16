@@ -204,6 +204,28 @@ controller-reviewed steps** (the prior autonomous agent overran repeatedly; now 
       must become the source of truth for outbound snapshots; BEHAVIOR/TRANSLATION should
       ultimately come from engine/captured tables, not hard-coded Python defaults.
 
+### ✅ M5.1e — entry-map render fix + self-connection re-seam (2026-06-16)
+Two evidenced fixes after a live rendering-client smoke + full Ghidra RE of the handshake (see
+`memory/m4-tick-seam-render-gated.md`):
+- **Entry map now loads on a real client.** Root cause (empirical byte-diff vs the working Python
+  server): the accept burst sent HELLO **VERSION (sub 0)** between `UDP_CONFIG` and `SESSION_KEY`.
+  VERSION is a client->server packet; echoing it back desynced the client's HELLO parser so it never
+  read the session key. Removed it to match Python's `UDP_CONFIG -> SESSION_KEY`. The external
+  `-root` client now connects, logs in, and **renders the bpass map** (screenshot-confirmed). TDD:
+  `Connection.AcceptBurstIsUdpConfigThenSessionKeyNoVersion`. 81/81 CTest, lint PASS.
+- **Server tick re-seamed off the render gate.** `Client_Main`'s loop calls `Client_RenderFrame`
+  only when `DAT_005b83f4` (window-active) is set; our hidden window means it is ~never called, so
+  the M4 tick (hooked there) died during login/connect. Moved the tick to **`Net_ServiceConnection`
+  @ 0x46b830** (called every loop iteration, all states): detour calls the original then runs the
+  guarded server tick (MVP bridge + self-connection drive). Tick now survives (300+ ticks vs 1-2).
+- **Self-connection now links.** The injected instance connects to its own `:2627`; the UDP key-echo
+  (sent by the render-gated login screen, dormant headless) is now driven from the tick via
+  `Net_SendHelloName @ 0x46b690` once the engine stores the key (`DAT_00678267==1`). Added handshake-
+  aware **batched-UDP splitting** (the engine flushes "Hello There" 0x08 + key-echo 0x13 in one
+  datagram). Session 1 reaches `AwaitingUsername`. **Still open:** drive the self-connection's
+  LOGIN (0x21 user/pass) to reach in-game so the engine owns the world. Added verbose UDP/TCP hex
+  wire logging (DEBUG).
+
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites

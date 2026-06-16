@@ -369,6 +369,22 @@ auto __cdecl Stub_Client_RunMainLoop_Observe() -> void {
 // VA pinned here (gen/addresses.h holds functions only).
 constexpr std::uint32_t kClientRenderFrameVA = 0x004281a0;
 
+// Net_ServiceConnection @ 0x0046b830 (void __stdcall) is called UNCONDITIONALLY every
+// iteration of Client_Main's loop, BEFORE the DAT_005b83f4 render gate. It is therefore
+// the always-pumped seam for the headless server tick — unlike Client_RenderFrame, which
+// only runs when the (hidden) window is "active" and so dies during login/connect. See
+// memory/m4-tick-seam-render-gated.
+constexpr std::uint32_t kNetServiceConnectionVA = 0x0046b830;
+
+// Net_SendHelloName @ 0x0046b690 (void __stdcall): sends the UDP HELLO key echo (sub 1)
+// using the stored session key (DAT_00677f24). Normally driven by the render-gated login
+// screen update, which never runs headless — so we drive it from the server tick.
+constexpr std::uint32_t kNetSendHelloNameVA = 0x0046b690;
+
+// DAT_00678267: engine flag set to 1 by Net_HandleHello once it stores the server's
+// session key. Gate for driving the key echo above.
+constexpr std::uint32_t kEngineKeyRecvFlagVA = 0x00678267;
+
 // Per-tick pacing when render is neutered (ms). Matches the engine's native idle
 // Util_SleepMillis(100) cadence (~10 Hz). M5 can lower this for a faster server tick.
 constexpr DWORD kServerTickPaceMs = 100;
@@ -381,13 +397,17 @@ constexpr UINT kTickFaultExitCode = 0x5754;
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<std::uint64_t> g_guarded_tick{0};
 
+// Trampoline to the real Net_ServiceConnection (filled by InstallDetour). Our tick
+// detour calls through to it so the engine's connection keeps being serviced.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+void* g_net_service_connection_orig = nullptr;
+
 void __cdecl PaceServerTick(void* /*user*/) {
-    // No rendering on a headless server. Pace the tick so the inline loop does not
-    // busy-spin when the window proc has set the render gate.
+    // Only reached when the window proc has set the render gate (DAT_005b83f4 != 0).
+    // We neuter the draw and pace so the loop does not busy-spin. The actual server
+    // tick now lives on Net_ServiceConnection (always pumped), not here.
     WFH_TRACE("tick", "Client_RenderFrame suppressed; pacing %lums",
               static_cast<unsigned long>(kServerTickPaceMs));
-    server::ProcessMvpOnlineTick(
-        static_cast<std::uint32_t>(g_guarded_tick.load(std::memory_order_relaxed)));
     Sleep(kServerTickPaceMs);
 }
 
@@ -397,6 +417,49 @@ auto WINAPI Stub_Client_RenderFrame() -> void {
     breadcrumb.phase = "Client_RenderFrame";
     const server::TickGuardResult result =
         server::RunProtectedTick(breadcrumb, &PaceServerTick, nullptr);
+    if (!result.ok) {
+        Log::Shutdown();
+        ExitProcess(kTickFaultExitCode);
+    }
+}
+
+// The headless server tick body, driven from the always-pumped Net_ServiceConnection
+// seam. Drives (a) the engine self-connection handshake and (b) the MVP online bridge.
+void __cdecl ServerTickBody(void* /*user*/) {
+    // Self-connection drive: the injected instance connects to its OWN server socket as
+    // a client. The login-screen update (@ 0x004622e0) that would echo the session key
+    // over UDP is render-gated and never runs headless, so once the engine has stored
+    // the server's session key we drive its own key-echo sender. On the engine main
+    // thread (this detour runs inside Net_ServiceConnection), so it is ABI-/thread-safe.
+    static bool s_drove_key_echo = false;
+    // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
+    const auto engine_key_recv =
+        *static_cast<volatile std::uint8_t*>(TargetAt(kEngineKeyRecvFlagVA));
+    if (!s_drove_key_echo && engine_key_recv == 1) {
+        WFH_INFO("tick", "self-connection: engine has session key; driving Net_SendHelloName");
+        // Net_SendHelloName is void __stdcall(void); TargetAt yields its entry point.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        reinterpret_cast<void(__stdcall*)()>(TargetAt(kNetSendHelloNameVA))();
+        s_drove_key_echo = true;
+    }
+
+    server::ProcessMvpOnlineTick(
+        static_cast<std::uint32_t>(g_guarded_tick.load(std::memory_order_relaxed)));
+}
+
+// Detour for Net_ServiceConnection (void __stdcall). Calls the engine's real net pump
+// first, then runs our guarded server tick. This seam fires every Client_Main loop
+// iteration regardless of the render gate, so the tick survives login/connect.
+auto WINAPI Stub_Net_ServiceConnection() -> void {
+    if (g_net_service_connection_orig != nullptr) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        reinterpret_cast<void(__stdcall*)()>(g_net_service_connection_orig)();
+    }
+    server::TickBreadcrumb breadcrumb;
+    breadcrumb.tick = g_guarded_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+    breadcrumb.phase = "Net_ServiceConnection";
+    const server::TickGuardResult result =
+        server::RunProtectedTick(breadcrumb, &ServerTickBody, nullptr);
     if (!result.ok) {
         Log::Shutdown();
         ExitProcess(kTickFaultExitCode);
@@ -468,6 +531,21 @@ auto InstallServerTick() -> bool {
     return true;
 }
 
+// Install the always-pumped server tick on Net_ServiceConnection. CALLS THROUGH to the
+// engine's real net pump (trampoline in g_net_service_connection_orig), then runs our
+// guarded tick (self-connection handshake drive + MVP bridge). Returns true on success.
+auto InstallServerNetTick() -> bool {
+    WFH_DEBUG("head", "installing Net_ServiceConnection server tick hook");
+    if (!InstallDetour(TargetAt(kNetServiceConnectionVA), AsVoidPtr(&Stub_Net_ServiceConnection),
+                       &g_net_service_connection_orig)) {
+        WFH_FATAL("head", "failed to install Net_ServiceConnection server tick");
+        return false;
+    }
+    WFH_INFO("head", "server tick installed on Net_ServiceConnection (always-pumped seam, "
+                     "survives login/connect)");
+    return true;
+}
+
 // Observation detour for Client_RunMainLoop @ 0x4a0aa0. NOTE: with the headless
 // server design (M4.2) we keep DAT_00677f1d == 0, so Client_Main's inline loop runs
 // forever and this terminal path is NOT taken. Kept as a tripwire: if it ever fires,
@@ -517,6 +595,14 @@ auto InstallHeadStubs() -> bool {
     // DAT_00677f1d == 0 so that loop runs indefinitely (we do NOT spoof the connect
     // gate, which would divert to the terminal App_RunGameAndExit -> exit path).
     if (!InstallServerTick()) {
+        return false;
+    }
+
+    // Server tick on the always-pumped Net_ServiceConnection seam (runs every loop
+    // iteration regardless of the render gate), so the self-connection handshake drive
+    // and the MVP bridge survive the login/connect phase where Client_RenderFrame is
+    // not called. See memory/m4-tick-seam-render-gated.
+    if (!InstallServerNetTick()) {
         return false;
     }
 

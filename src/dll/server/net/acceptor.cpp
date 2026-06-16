@@ -55,6 +55,23 @@ constexpr std::size_t kUdpLengthPrefixSize = 2;
 constexpr std::size_t kUdpOpcodeSize = 1;
 constexpr unsigned kByteShift = 8;
 
+// DIAGNOSTIC (temporary): render a byte span as space-separated lowercase hex so we
+// can compare the engine's raw wire bytes against the known-good Python reference.
+auto HexDump(const std::uint8_t* data, std::size_t len) -> std::string {
+    std::string out;
+    constexpr std::size_t kMaxDumpBytes = 64;
+    const std::size_t shown = len < kMaxDumpBytes ? len : kMaxDumpBytes;
+    out.reserve(shown * 3);
+    for (std::size_t i = 0; i < shown; ++i) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        const std::uint8_t byte = data[i];
+        out.push_back(kHexDigits.at(byte >> kBitsPerNibble));
+        out.push_back(kHexDigits.at(byte & kNibbleMask));
+        out.push_back(' ');
+    }
+    return out;
+}
+
 // Generate a short random session key the client must echo over UDP to link its
 // endpoint. Not a security token (the protocol is trust-the-echo), just a nonce.
 auto MakeSessionKey(std::uint64_t session_id) -> std::string {
@@ -191,11 +208,9 @@ auto TryRouteLinkedUdpFrame(Acceptor::Impl& impl, const proto::UdpFrame& frame,
     return true;
 }
 
-// Route a UDP datagram (key echo) to the matching not-yet-linked connection. Kept a
-// file-local helper so the winsock sockaddr type stays out of the public header.
-void HandleUdpDatagram(Acceptor::Impl& impl, const std::uint8_t* data, std::size_t len,
-                       const sockaddr_in& from) {
-    WFH_TRACE("net", "UDP datagram received bytes=%zu clients=%zu", len, impl.clients.size());
+// Route ONE UDP packet (key echo) to the matching not-yet-linked / linked connection.
+void HandleOneUdpPacket(Acceptor::Impl& impl, const std::uint8_t* data, std::size_t len,
+                        const sockaddr_in& from) {
     if (const auto seq_frame = proto::DecodeUdpFrame(data, len);
         seq_frame && TryLinkUdpFrame(impl, *seq_frame, from)) {
         return;
@@ -215,7 +230,82 @@ void HandleUdpDatagram(Acceptor::Impl& impl, const std::uint8_t* data, std::size
             return;
         }
     }
-    WFH_TRACE("net", "UDP datagram ignored; no matching pending session");
+    WFH_TRACE("net", "UDP packet ignored; no matching pending session");
+}
+
+// HELLO subtype bytes and handshake-packet header sizes (named so the splitter below
+// is free of magic numbers).
+constexpr std::uint8_t kHelloSubVersion = 0x00;   // [13][00][i32 version]
+constexpr std::uint8_t kHelloSubConfig = 0x01;    // [13][01][u16 strlen][string]
+constexpr std::uint8_t kHelloSubConfirm = 0x02;   // [13][02]
+constexpr std::uint8_t kHelloSubVerified = 0x03;  // [13][03]
+constexpr std::uint8_t kHelloSubNone = 0xFF;      // sentinel: too short to hold a subtype
+constexpr std::size_t kHelloThereHeader = 3;      // opcode + u16 strlen
+constexpr std::size_t kHelloConfigHeader = 4;     // opcode + subtype + u16 strlen
+constexpr std::size_t kHelloVersionLen = 6;       // opcode + subtype + i32
+constexpr std::size_t kHelloShortLen = 2;         // opcode + subtype only
+
+// Length of a handshake packet whose payload ends with a u16-BE-length string: the fixed
+// header bytes plus that embedded string length (the u16 sits in the 2 bytes ending the
+// header). Clamped to the datagram length.
+auto StringPacketLength(const std::uint8_t* data, std::size_t len, std::size_t header)
+    -> std::size_t {
+    if (len < header) {
+        return len;
+    }
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    const std::size_t embedded =
+        (static_cast<std::size_t>(data[header - 2]) << kByteShift) | data[header - 1];
+    // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    const std::size_t pkt = header + embedded;
+    return pkt <= len ? pkt : len;
+}
+
+// Length of the FIRST handshake packet in a (possibly batched) UDP datagram. The engine
+// can flush several HELLO/ROOT packets into one datagram (e.g. "Hello There" +
+// key-echo), so we split on the known handshake shapes; anything else consumes the rest
+// of the datagram (single packet / seq-framed game traffic).
+auto FirstUdpPacketLength(const std::uint8_t* data, std::size_t len) -> std::size_t {
+    if (len < 1) {
+        return len;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    const std::uint8_t opcode = data[0];
+    if (opcode == static_cast<std::uint8_t>(proto::Opcode::HelloThere)) {
+        return StringPacketLength(data, len, kHelloThereHeader);
+    }
+    if (opcode != static_cast<std::uint8_t>(proto::Opcode::Hello)) {
+        return len;  // unknown / seq-framed game packet: consume the whole datagram
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    const std::uint8_t sub = len >= kHelloShortLen ? data[1] : kHelloSubNone;
+    if (sub == kHelloSubConfig) {
+        return StringPacketLength(data, len, kHelloConfigHeader);
+    }
+    if (sub == kHelloSubVersion) {
+        return len < kHelloVersionLen ? len : kHelloVersionLen;
+    }
+    if (sub == kHelloSubConfirm || sub == kHelloSubVerified) {
+        return len < kHelloShortLen ? len : kHelloShortLen;
+    }
+    return len;
+}
+
+// Route a UDP datagram, splitting any batched handshake packets first.
+void HandleUdpDatagram(Acceptor::Impl& impl, const std::uint8_t* data, std::size_t len,
+                       const sockaddr_in& from) {
+    WFH_TRACE("net", "UDP datagram received bytes=%zu clients=%zu", len, impl.clients.size());
+    std::size_t cursor = 0;
+    while (cursor < len) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        std::size_t pkt = FirstUdpPacketLength(data + cursor, len - cursor);
+        if (pkt == 0 || pkt > len - cursor) {
+            pkt = len - cursor;
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        HandleOneUdpPacket(impl, data + cursor, pkt, from);
+        cursor += pkt;
+    }
 }
 
 // Send a byte buffer on a connected TCP socket (centralizes the SDK char* cast).
@@ -273,7 +363,12 @@ void PumpUdp(Acceptor::Impl& impl) {
                                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                                reinterpret_cast<sockaddr*>(&from), &from_len);
     if (count > 0) {
-        WFH_TRACE("net", "recvfrom UDP bytes=%d", count);
+        // Verbose wire diagnostic: hex of the raw datagram + source port. (Reads only
+        // the receive buffer — safe in host tests, unlike engine-memory probes which
+        // belong in the injected DLL tick.)
+        const std::string hex = HexDump(buf.data(), static_cast<std::size_t>(count));
+        WFH_DEBUG("net", "recvfrom UDP bytes=%d srcport=%u hex=[ %s]", count,
+                  static_cast<unsigned>(ntohs(from.sin_port)), hex.c_str());
         HandleUdpDatagram(impl, buf.data(), static_cast<std::size_t>(count), from);
     } else if (count == SOCKET_ERROR) {
         WFH_DEBUG("net", "recvfrom UDP failed (%d)", WSAGetLastError());
@@ -291,8 +386,11 @@ auto PumpTcpClient(std::uint64_t session_id, TcpClient& client) -> bool {
                   static_cast<unsigned long long>(session_id), count, WSAGetLastError());
         return true;  // peer closed or error
     }
-    WFH_TRACE("net", "TCP session %llu recv bytes=%d", static_cast<unsigned long long>(session_id),
-              count);
+    {
+        const std::string hex = HexDump(buf.data(), static_cast<std::size_t>(count));
+        WFH_DEBUG("net", "TCP session %llu recv bytes=%d hex=[ %s]",
+                  static_cast<unsigned long long>(session_id), count, hex.c_str());
+    }
     const auto step = client.conn->OnTcpData(buf.data(), static_cast<std::size_t>(count));
     SendBytes(client.sock, step.tcp_out);
     if (!step.tcp_out.empty()) {
