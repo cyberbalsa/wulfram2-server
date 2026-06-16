@@ -6,7 +6,12 @@
 
 **Architecture:** A 32-bit Windows CMake project mirroring `Wulf-Forge/wulfram-lua/`. `loader.exe` does `CreateProcessW(CREATE_SUSPENDED)` → `VirtualAllocEx`/`WriteProcessMemory` → `CreateRemoteThread(LoadLibraryW)` → `ResumeThread`. `wulf_headless.dll` has a minimal `DllMain` that spawns `InitThread`; the thread validates the target binary against a generated manifest, brings up logging, then (in later milestones) installs MinHook detours. A Python generator turns the Ghidra `functions.tsv` export into `addresses.h` (typed function pointers + global offsets) and `binary_manifest.h` (PE stamps + expected bytes at each hook site).
 
-**Tech Stack:** C++17, MSVC (x86/Win32 only), CMake ≥ 3.24 + Ninja, MinHook (FetchContent), Python 3.12 (address generator + pytest), Win32 API (`<windows.h>`, `dbghelp`, Winsock later).
+**Tech Stack:** C++17, MSVC (x86/Win32 only), CMake ≥ 3.24 + Ninja, MinHook v1.3.4 (FetchContent), **GoogleTest** (FetchContent + CTest) for C++ tests, **clang-tidy + cppcheck + MSVC `/analyze`** for static analysis, Python 3.12 (address generator + pytest), Win32 API (`<windows.h>`, `dbghelp`, Winsock later).
+
+> **Convention updates (2026-06-15, mid-execution):**
+> 1. **Testing = GoogleTest.** The hand-rolled `Expect()`/`cases[]` harness shown in the task snippets below is superseded. Translate each test snippet to GoogleTest idiom — same assertions, gtest macros: `TEST(Suite, Name){ EXPECT_*/ASSERT_* }`, registered automatically via `gtest_discover_tests`. Run tests with `ctest` (or the `wfh_tests` exe). Task 1.5 migrates the existing Task 1 tests and wires the framework.
+> 2. **Static analysis = strong.** clang-tidy (LLVM x64) runs in-build (`WFH_ENABLE_CLANG_TIDY` default **ON** once installed) and cppcheck via a `lint.ps1`/CI step; MSVC `/analyze` available. Keep new code clean under all three.
+> 3. **PROGRESS.md.** Update the repo-root `PROGRESS.md` after each task completes (status checkbox + a one-line log entry).
 
 **Scope:** This plan covers **Milestone 0** (toolchain + logging), **Milestone 1** (loader + injection + binary pinning), and **Milestone 2** (address generation + ABI bindings + hook-site self-check). Milestones 3–7 are deferred — see "Deferred Milestones" at the end.
 
@@ -120,10 +125,23 @@ include(FetchContent)
 FetchContent_Declare(
     minhook
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG v1.3.3
+    GIT_TAG v1.3.4
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(minhook)
+
+# MinHook ships no root CMakeLists, so FetchContent populates sources but defines no
+# target. Build its own sources into a `minhook` static target (target name preserved
+# so the link + /W0 below apply).
+if(NOT TARGET minhook)
+    add_library(minhook STATIC
+        ${minhook_SOURCE_DIR}/src/buffer.c
+        ${minhook_SOURCE_DIR}/src/hook.c
+        ${minhook_SOURCE_DIR}/src/trampoline.c
+        ${minhook_SOURCE_DIR}/src/hde/hde32.c
+        ${minhook_SOURCE_DIR}/src/hde/hde64.c)
+    target_include_directories(minhook PUBLIC ${minhook_SOURCE_DIR}/include)
+endif()
 
 # --- our static libraries ---
 add_library(wfh_log STATIC src/log/log.cpp)
