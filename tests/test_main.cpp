@@ -1,3 +1,4 @@
+#include "wfh/engine_abi.hpp"
 #include "wfh/injector.hpp"
 #include "wfh/log.hpp"
 #include "wfh/pe_validate.hpp"
@@ -154,6 +155,17 @@ TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {
     const auto r = wfh::ValidateHookSitesInProcess(m);
     EXPECT_FALSE(r.ok);
     EXPECT_NE(r.error.find("unreadable"), std::string::npos);  // must NOT fault the process
+}
+
+TEST(EngineAbi, TypedefsResolveFromGeneratedAddresses) {
+    // Build an ABI-correct function pointer at a real generated address.
+    // We do NOT call it (no live game here) — just verify the binding resolves non-null.
+    auto run_main_loop = wfh::abi::Fn<void>::At(wfh::addr::Client_RunMainLoop);
+    EXPECT_NE(run_main_loop, nullptr);
+    // __thiscall binding (as used for Net_* methods) must also form a valid pointer.
+    auto net_accept =
+        wfh::abi::Thiscall<int, void*, unsigned short>::At(wfh::addr::Net_InitAcceptSocket);
+    EXPECT_NE(net_accept, nullptr);
 }
 
 TEST(Injector, RejectsWrongBinaryBeforeSpawning) {
