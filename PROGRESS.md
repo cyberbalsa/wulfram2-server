@@ -73,6 +73,17 @@ real env bypasses (registry/browser), then hijack `Client_RunMainLoop` for the s
 never runs). See `memory/m3-approach-b-boot-hidden.md`. The M3.1-M3.9 head-chop commits stay in history (they
 map the boot path); the live install path will be reworked. Running in tight, reviewed steps from here.
 
+### ✅ M3 ACHIEVED via Approach B (verified 2026-06-16, commit `4a5022c`)
+`wulfram2.exe` boots **fully headless**: force GDI software renderer (`DAT_00679169=1`) + hide the window
+(MinHook `CreateWindowExA`/`ShowWindow` → strip `WS_VISIBLE`, `+WS_EX_TOOLWINDOW`, `SW_HIDE`). Retired the
+11 `*_Init` stubs + M3.4/3.8/3.9 + the `DAT_00679123` clear; kept registry/browser bypasses + the
+`Client_RunMainLoop` observation detour. **Independently verified** (controller's own run): `MainWindowHandle=0`,
+no window, CPU rising (running a real loop), stable, no AV; clean process teardown. 16/16 ctest, lint PASS.
+**Nuance for M4:** the game runs `Client_Main`'s INLINE render loop, not `Client_RunMainLoop @ 0x4a0aa0`
+(that path is `DAT_00677f1d`-gated and not taken here) — so M4 must hijack the inline loop.
+**Process note:** a subagent overran scope badly (ran hours, made unsanctioned commits incl. the architecture
+pivot). Outcome aligns with the approved Approach B, but going forward: tight, reviewed, single-purpose steps.
+
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites
