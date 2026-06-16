@@ -23,6 +23,11 @@ namespace {
 
 constexpr std::size_t kErrBufSize = 256;
 
+// Upper bound on how long the remote LoadLibraryW thread may run before we treat
+// it as wedged. A healthy load completes in milliseconds; 15s tolerates a heavily
+// loaded box without hanging the loader forever on a stuck target.
+constexpr DWORD kRemoteLoadTimeoutMs = 15000;
+
 // Format the most recent Win32 error into "<api> failed (<code>): <message>".
 // Called only on a failure path right after the failing API, so GetLastError()
 // still reflects that call.
@@ -110,6 +115,9 @@ auto InjectDll(PROCESS_INFORMATION& proc_info, const InjectionPlan& plan) -> Lau
     }
 
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32 == nullptr) {
+        return FailInject(proc_info, remote, LastErrorMessage("GetModuleHandleW(kernel32.dll)"));
+    }
     // reinterpret_cast of LoadLibraryW (FARPROC) to LPTHREAD_START_ROUTINE is the
     // canonical CreateRemoteThread idiom: kernel32 is mapped at the same base in
     // every process, and LoadLibraryW's __stdcall(LPVOID)->BOOL shape is ABI-
@@ -124,9 +132,23 @@ auto InjectDll(PROCESS_INFORMATION& proc_info, const InjectionPlan& plan) -> Lau
     if (thr == nullptr) {
         return FailInject(proc_info, remote, LastErrorMessage("CreateRemoteThread"));
     }
-    WaitForSingleObject(thr, INFINITE);
+    const DWORD wait = WaitForSingleObject(thr, kRemoteLoadTimeoutMs);
+    if (wait == WAIT_TIMEOUT) {
+        CloseHandle(thr);
+        return FailInject(proc_info, remote, "remote LoadLibraryW timed out");
+    }
+    if (wait != WAIT_OBJECT_0) {
+        const auto err = LastErrorMessage("WaitForSingleObject");
+        CloseHandle(thr);
+        return FailInject(proc_info, remote, err);
+    }
+
     DWORD remote_exit = 0;
-    GetExitCodeThread(thr, &remote_exit);
+    if (GetExitCodeThread(thr, &remote_exit) == FALSE) {
+        const auto err = LastErrorMessage("GetExitCodeThread");
+        CloseHandle(thr);
+        return FailInject(proc_info, remote, err);
+    }
     CloseHandle(thr);
 
     // The remote thread's exit code is LoadLibraryW's return (the loaded HMODULE
@@ -143,9 +165,24 @@ auto InjectDll(PROCESS_INFORMATION& proc_info, const InjectionPlan& plan) -> Lau
 }  // namespace
 
 auto LaunchAndInject(const InjectionPlan& plan) -> LaunchResult {
+    // --- TOCTOU lock: pin the exact bytes we validate ---
+    // Open the target with FILE_SHARE_READ only (denies others write/delete) and
+    // HOLD this handle across CheckBinaryPinning + CreateProcessW so the validated
+    // image cannot be swapped or modified in the validation->launch window. The OS
+    // image mapping done by CreateProcessW also opens for read, which this sharing
+    // mode permits, so holding the lock does not block the spawn.
+    HANDLE lock = CreateFileW(plan.game_exe_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (lock == INVALID_HANDLE_VALUE) {
+        const auto err = LastErrorMessage("CreateFileW(lock)");
+        WFH_FATAL("loader", "%s", err.c_str());
+        return {false, 0, err};
+    }
+
     // --- Binary pinning gate (BEFORE touching the process) ---
     auto pinned = CheckBinaryPinning(plan);
     if (!pinned.ok) {
+        CloseHandle(lock);
         return pinned;
     }
 
@@ -164,9 +201,14 @@ auto LaunchAndInject(const InjectionPlan& plan) -> LaunchResult {
     if (created == FALSE) {
         const auto err = LastErrorMessage("CreateProcessW");
         WFH_FATAL("loader", "%s", err.c_str());
+        CloseHandle(lock);
         return {false, 0, err};
     }
     WFH_INFO("loader", "created suspended pid=%lu", proc_info.dwProcessId);
+
+    // The child now holds its own image section; the lock has done its job and can
+    // be released regardless of how the rest of injection turns out.
+    CloseHandle(lock);
 
     // --- Inject; on failure InjectDll has already destroyed the process ---
     auto injected = InjectDll(proc_info, plan);
@@ -174,8 +216,15 @@ auto LaunchAndInject(const InjectionPlan& plan) -> LaunchResult {
         return injected;
     }
 
-    // Injection succeeded: let the game run and hand back the pid.
-    ResumeThread(proc_info.hThread);
+    // Injection succeeded (remote alloc already freed): let the game run. A failed
+    // ResumeThread leaves the process suspended, so tear it down rather than ship a
+    // wedged game.
+    if (ResumeThread(proc_info.hThread) == static_cast<DWORD>(-1)) {
+        const auto err = LastErrorMessage("ResumeThread");
+        WFH_FATAL("loader", "%s", err.c_str());
+        DestroyProcess(proc_info, nullptr);
+        return {false, 0, err};
+    }
     const DWORD id = proc_info.dwProcessId;
     CloseProcessInfo(proc_info);
     return {true, id, {}};
