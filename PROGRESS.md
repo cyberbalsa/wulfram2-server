@@ -2,6 +2,9 @@
 
 Living log of what's been done. Newest entries at the top of each section.
 
+**Repo:** https://github.com/cyberbalsa/wulfram2-server (private) · default branch `master` ·
+identity `cyberbalsa <804052+cyberbalsa@users.noreply.github.com>`.
+
 ## What this is
 Turn the original `wulfram2.exe` client into a headless, authoritative multiplayer server by
 **injecting a C++ DLL**, stubbing the render/audio/input "head", hijacking `Client_RunMainLoop`,
@@ -43,5 +46,8 @@ VS 2022 x86 (`vcvars32.bat`) ✓, VS-bundled cmake 3.31.6 ✓, ninja ✓, python
 Installing: LLVM/clang-tidy (x64), cppcheck.
 
 ## Log
+- 2026-06-15 — Published to GitHub as private `cyberbalsa/wulfram2-server`. Rewrote all commit
+  history to the GitHub noreply identity (removed a stray `fffics@rit.edu`). Consolidated work onto
+  `master`. Installed LLVM/clang-tidy 22.1.7 (`C:\Program Files\LLVM`) and cppcheck 2.21.0.
 - 2026-06-15 — Task 0, Task 1 + hardening complete. Rust evaluated/rejected. GoogleTest + clang-tidy
   + cppcheck adopted per user direction. PROGRESS.md started.
