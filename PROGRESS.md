@@ -57,8 +57,13 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
 Foundation done: 32-bit CMake/MinHook build, zero-warning quality gate (clang-tidy + cppcheck + git hooks),
 async logging, suspended-inject loader with PE binary-pinning + TOCTOU lock, address/manifest generation from
 the real binary, ABI typedefs, and a minimal DllMain→InitThread that runs in the live game process. Codex-reviewed
-the security-critical paths (PE validator, injector). Next: **Milestone 3 — head-chop** (stub the 12 `*_Init`
-seams, capture real hook-site bytes, prove headless boot to the loop seam).
+the security-critical paths (PE validator, injector). Final-review fixes applied (commit `d17becc`, 15/15 ctest): intentionally-leaked logger singleton
+(no DLL-teardown join hang), `inline constexpr kSites`, malformed-PE fuzz tests, `ParseLogLevel`
+precision, module-relative loader log.
+
+Next: **Milestone 3 — head-chop** (stub the 12 `*_Init` seams, capture real hook-site bytes, prove
+headless boot to the loop seam). Design input: `docs/superpowers/notes/2026-06-16-m3-head-chop-discovery.md`
+— key finding: head/body are decoupled (no body-init reads head globals), so 11/12 seams are plain-stubbable.
 - Deferred to follow-on plans: **M3** head chop, **M4** loop hijack + fixed timestep + SEH,
   **M5** Net object + sessions, **M6** physics drive, **M7** multi-client + game rules.
 
