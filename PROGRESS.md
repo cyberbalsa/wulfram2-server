@@ -64,6 +64,17 @@ precision, module-relative loader log.
 Next: **Milestone 3 — head-chop** (stub the 12 `*_Init` seams, capture real hook-site bytes, prove
 headless boot to the loop seam). Design input: `docs/superpowers/notes/2026-06-16-m3-head-chop-discovery.md`
 — key finding: head/body are decoupled (no body-init reads head globals), so 11/12 seams are plain-stubbable.
+
+## Milestone 3 — Head-Chop (in progress)
+Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
+- [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites
+      with real `wulfram2.exe` bytes; self-check now validates them. Commit `ab2c7b2`. 15/15 ctest, pytest 2/2.
+- [x] **M3.2** — MinHook wrapper (`engine_hooks`) + loader↔InitThread ready handshake (pid-keyed named
+      event; loader waits 10s + tears down before `ResumeThread`). Commit `89abbe3`. 16/16 ctest.
+- [x] **M3.3** — 11 head-seam no-op detours, ABI-correct (incl. `__thiscall`→`__fastcall`+dummy-EDX and
+      `__fastcall` Snd), **verified via dumpbin disasm** (`ret 4`/bare `ret`/register reads). Commit `c85dfcd`.
+- [ ] **M3.4** — render-driver vtable defense (short-circuit `Render_SwitchActiveDriver` / non-null stub). *(next)*
+- [ ] **M3.5** — headless-boot integration smoke (reach loop seam, zero AVs, no head devices).
 - Deferred to follow-on plans: **M3** head chop, **M4** loop hijack + fixed timestep + SEH,
   **M5** Net object + sessions, **M6** physics drive, **M7** multi-client + game rules.
 
