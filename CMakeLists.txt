@@ -26,9 +26,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-# MinHook v1.3.3 ships no CMakeLists.txt (only MSBuild projects), so
-# FetchContent populates the sources but defines no `minhook` target.
-# Define the target ourselves from the fetched sources when it is missing.
+# MinHook v1.3.4 ships its own CMakeLists.txt, so FetchContent_MakeAvailable
+# defines the `minhook` target itself and this block does not run. It is kept
+# as a defensive fallback: older tags (e.g. v1.3.3) ship no CMakeLists, leaving
+# the sources populated but no target — in that case we define it ourselves.
 if(NOT TARGET minhook)
     add_library(minhook STATIC
         ${minhook_SOURCE_DIR}/src/buffer.c
