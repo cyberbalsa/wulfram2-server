@@ -284,6 +284,27 @@ glue; **verified live** that the engine's own object lands in its world list + s
   control injection so client inputs drive their server-side tank. Also: default `world_host` on once
   the relay path is in (repo config stays off for now).
 
+### ✅ M6.1-min(a) — read the engine's authoritative world by value (2026-06-16)
+The engine is now the source of truth, and we can read its live world state on the tick thread —
+the foundation for the replication relay.
+- **TDD (host-tested):** `ExtractEntitySnapshot(const uint8_t* entity) -> MvpEntitySnapshot` reads the
+  M5.0 contract offsets (oid@+0xb4, type@+0x8, pos@+0xc, vel@+0x18, rot@+0x30, health@+0xd0,
+  energy@+0xd4, team@+0xf0) via alignment-safe memcpy. Offsets are named `static constexpr` members
+  (`EntitySnapshotOffsets`) shared with the test. 2 new gtests (synthetic buffer, incl. negatives).
+- **Engine glue:** `ReadEngineWorld()` walks `DAT_006785e4` → `[WorldMap+0]` Util_List
+  (count@+0, head@+4) → nodes (entity@+8, next@+0), capped at 4096, calling `ExtractEntitySnapshot`
+  per entity → `vector<MvpEntitySnapshot>` by value. Engine-thread-only; runs inside the SEH-guarded
+  tick. A throttled readback log proves it each second.
+- **Smoke (injected, cleaned up):** with the spawned tank present, the tick logs
+  `engine world readback: 1 entity → entity[0] oid=1 type=1 team=1 pos=2437.0,3269.0,-180.0` — real
+  engine data read by value, matching the cdb-verified struct, no fault. Build = **93/93 CTest**,
+  `lint.ps1` = **PASS** (cppcheck/clang-tidy analyze with 64-bit models, so `DerefU32` returns
+  `uint32` to dodge a spurious truncation finding; the asm-only `engine_thunks.cpp` stays clang-tidy
+  excluded).
+- **Next (M6.1-min(b)):** feed `ReadEngineWorld()` to connected sessions as `VIEW_UPDATE` (the encoder
+  + session fanout already exist + are tested) so a real rendering client sees the server's
+  authoritative tank; diff per-client for create/update/destroy comes after broadcast-to-all works.
+
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites

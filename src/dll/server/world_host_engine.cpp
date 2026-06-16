@@ -3,12 +3,15 @@
 #include "server/engine_thunks.hpp"
 
 #include "wfh/log.hpp"
+#include "wfh/server/entity_snapshot.hpp"
 #include "wfh/server/runtime.hpp"
 #include "wfh/server/server_config.hpp"
 #include "wfh/server/world_host.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // Every WFH_* logging call expands to the project's intentional do-while(0) guard
 // macro that forwards a printf-style C variadic to Log::Write. Suppress the two
@@ -52,6 +55,14 @@ constexpr float kWorldScale = 1.0F;
 // Let the engine's main loop settle after boot before driving the bring-up (the
 // tick fires every loop iteration; a brief delay avoids racing the init tail).
 constexpr int kSettleTicks = 30;
+
+// World-list walk (M6.1 readback). DAT_006785e4 -> WorldMap; [WorldMap+0] -> Util_List
+// (count@+0, head@+4); node {next@+0, data@+8}. Verified live via cdb.
+constexpr std::uint32_t kWorldMapPtrVA = 0x006785e4;
+constexpr std::size_t kListHeadOff = 4;
+constexpr std::size_t kNodeEntityOff = 8;
+constexpr int kMaxWorldEntities = 4096;  // sanity cap if memory is unexpected
+constexpr int kReadbackEvery = 200;      // throttle the readback log (~once/sec)
 
 void EngineGameResetSession() {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast,performance-no-int-to-ptr)
@@ -114,6 +125,57 @@ void PerformAction(WorldHostAction action, char* map_name, const WorldHostEntity
     }
 }
 
+// Read a 32-bit value (pointer or int) from engine memory at `addr`. x86, so a
+// uintptr_t holds a 32-bit word. Engine-thread-only (the world is single-threaded).
+auto DerefU32(std::uintptr_t addr) -> std::uint32_t {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast,clang-analyzer-core.FixedAddressDereference)
+    return *reinterpret_cast<const std::uint32_t*>(addr);
+}
+
+// Walk the engine's authoritative world list (DAT_006785e4) and extract a by-value
+// snapshot of every entity. The engine is now the source of truth; this read runs on
+// the SEH-guarded tick thread (a stale/garbage pointer faults safely). The relay
+// (M6.1) will serialize these to clients.
+auto ReadEngineWorld() -> std::vector<MvpEntitySnapshot> {
+    std::vector<MvpEntitySnapshot> out;
+    const std::uintptr_t world_map = DerefU32(kWorldMapPtrVA);
+    if (world_map == 0) {
+        return out;  // world not loaded yet
+    }
+    const std::uintptr_t list = DerefU32(world_map);  // WorldMap+0 -> Util_List
+    if (list == 0) {
+        return out;
+    }
+    const auto count = static_cast<int>(DerefU32(list));  // list+0 -> count
+    std::uintptr_t node = DerefU32(list + kListHeadOff);  // list+4 -> head node
+    for (int i = 0; i < count && i < kMaxWorldEntities && node != 0; ++i) {
+        const std::uintptr_t entity = DerefU32(node + kNodeEntityOff);
+        if (entity != 0) {
+            // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
+            out.push_back(ExtractEntitySnapshot(reinterpret_cast<const std::uint8_t*>(entity)));
+        }
+        node = DerefU32(node);  // node+0 -> next
+    }
+    return out;
+}
+
+// Throttled proof that we can read the engine's real world state by value each tick.
+void LogWorldReadback() {
+    static int ticks = 0;
+    if (ticks++ % kReadbackEvery != 0) {
+        return;
+    }
+    const std::vector<MvpEntitySnapshot> world = ReadEngineWorld();
+    WFH_INFO("worldhost", "engine world readback: %zu entit%s", world.size(),
+             world.size() == 1 ? "y" : "ies");
+    if (!world.empty()) {
+        const MvpEntitySnapshot& head = world.front();
+        WFH_INFO("worldhost", "  entity[0] oid=%d type=%d team=%d pos=%.1f,%.1f,%.1f", head.net_id,
+                 head.unit_type, head.team, static_cast<double>(head.pos.at(0)),
+                 static_cast<double>(head.pos.at(1)), static_cast<double>(head.pos.at(2)));
+    }
+}
+
 }  // namespace
 
 void ProcessWorldHostTick() {
@@ -142,6 +204,12 @@ void ProcessWorldHostTick() {
     if (bootstrap.done() && !logged_done) {
         WFH_INFO("worldhost", "world-host bootstrap complete");
         logged_done = true;
+    }
+
+    // Once the world is populated, periodically read it back by value (the engine is
+    // now the source of truth). M6.1 will feed this snapshot to connected clients.
+    if (bootstrap.done()) {
+        LogWorldReadback();
     }
 }
 
