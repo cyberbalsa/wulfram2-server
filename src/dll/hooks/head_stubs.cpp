@@ -98,6 +98,17 @@ auto __cdecl Stub_Winsys_Input_InitWin32State() -> void {
     WFH_DEBUG("head", "stubbed Winsys_Input_InitWin32State");
 }
 
+// TEMP (M3): observation-only; M4 replaces the loop body.
+//
+// __cdecl() -> void. The real Client_RunMainLoop would drive the render/present
+// path through the now-null render driver and crash; for the M3 boot smoke we
+// only want to PROVE the game reached the loop seam headlessly. So this detour
+// logs arrival and RETURNS immediately WITHOUT calling the original. M4 replaces
+// the loop body with the real headless server tick.
+auto __cdecl Stub_Client_RunMainLoop_Observe() -> void {
+    WFH_INFO("boot", "reached Client_RunMainLoop — head-chop OK");
+}
+
 // __fastcall(int* self_in_ECX) -> bool/byte (1).
 //
 // Target is __fastcall with its only argument in ECX. A __fastcall detour with
@@ -132,6 +143,22 @@ auto TargetAt(std::uint32_t address) -> void* {
 }
 
 constexpr std::size_t kHeadStubCount = 11;
+
+// TEMP (M3): observation-only; M4 replaces the loop body. Install the
+// Client_RunMainLoop observation detour. Kept as its own helper so InstallHeadStubs
+// stays under the cognitive-complexity gate and the temp detour is easy to remove
+// in M4. Returns true on success; logs and returns false on MinHook error.
+auto InstallLoopObservationDetour() -> bool {
+    // The detour never calls through, so the trampoline is discarded.
+    void* original = nullptr;
+    if (!InstallDetour(TargetAt(addr::Client_RunMainLoop),
+                       AsVoidPtr(&Stub_Client_RunMainLoop_Observe), &original)) {
+        WFH_FATAL("head", "failed to install Client_RunMainLoop observation detour");
+        return false;
+    }
+    WFH_INFO("head", "TEMP (M3) observation detour installed: Client_RunMainLoop");
+    return true;
+}
 
 }  // namespace
 
@@ -170,7 +197,11 @@ auto InstallHeadStubs() -> bool {
     }
 
     WFH_INFO("head", "all %zu head stubs installed", kHeadStubCount);
-    return true;
+
+    // TEMP (M3): observation-only; M4 replaces the loop body. Install the loop
+    // seam observation detour alongside the head stubs, so it is live before the
+    // loader resumes the game thread.
+    return InstallLoopObservationDetour();
 }
 
 }  // namespace wfh
