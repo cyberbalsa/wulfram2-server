@@ -11,6 +11,19 @@
 #include <cstddef>
 #include <cstdint>
 
+// TEMP (M3.7 diagnostic) — remove after diagnosis. <windows.h> provides
+// RtlCaptureStackBackTrace() and USHORT; <intrin.h> provides _ReturnAddress().
+// Both are only needed by Stub_App_ExitGracefully below.
+#ifdef _MSC_VER
+#pragma warning(push, 0)
+#endif
+#include <windows.h>
+
+#include <intrin.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 // Every WFH_* logging call expands to the project's intentional do-while(0) guard
 // macro that forwards a printf-style C variadic to Log::Write. Suppress the two
 // macro-inherent findings file-wide so the call sites stay readable; all other
@@ -230,6 +243,61 @@ auto __cdecl Stub_Shell_OpenUrlWithDefaultBrowser(void* /*url*/) -> void {
 }
 
 // ---------------------------------------------------------------------------
+// TEMP (M3.7 diagnostic) — remove after diagnosis.
+//
+// App_ExitGracefully (0x0041db40) is a NORETURN full-shutdown routine ending in
+// _exit(). The headless boot reaches it before Client_RunMainLoop and exits
+// cleanly (code 0). It has ~7 callers; this detour logs WHICH caller fired, the
+// full call chain, and the two args, then CALLS THROUGH to the original via the
+// MinHook trampoline so behavior is UNCHANGED (the game still exits gracefully).
+// This is DIAGNOSIS ONLY: it does not skip, suppress, or alter the exit.
+//
+// ABI: void __cdecl App_ExitGracefully(int param_1, int param_2) — confirmed in
+// Ghidra (caller-clean, two stack args, noreturn). The detour matches it exactly
+// so the trampoline call-through is ABI-correct.
+
+// Trampoline slot for the call-through. Filled by InstallDetour; this is the ONE
+// head stub that must use a real `original` (the no-op stubs leave it null).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+void* g_app_exit_gracefully_orig = nullptr;
+
+// Module base of wulfram2.exe. The diagnostic logs each backtrace frame as a
+// module-relative RVA (frame - kModuleBase) so it maps straight onto Ghidra
+// addresses (VA = RVA + 0x00400000), plus the absolute VA for convenience.
+constexpr std::uintptr_t kModuleBase = 0x00400000;
+
+auto __cdecl Stub_App_ExitGracefully(int param_1, int param_2) -> void {
+    // Immediate caller (the instruction after the CALL into App_ExitGracefully).
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto ret_addr = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    WFH_WARN("diag",
+             "App_ExitGracefully ENTER args=(0x%X, 0x%X) immediate_caller: RVA=0x%X VA=0x%X",
+             static_cast<unsigned>(param_1), static_cast<unsigned>(param_2),
+             static_cast<unsigned>(ret_addr - kModuleBase), static_cast<unsigned>(ret_addr));
+
+    constexpr USHORT kMaxFrames = 16;
+    std::array<void*, kMaxFrames> frames{};
+    const USHORT captured = RtlCaptureStackBackTrace(0, kMaxFrames, frames.data(), nullptr);
+    for (USHORT i = 0; i < captured; ++i) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        const auto frame = reinterpret_cast<std::uintptr_t>(frames.at(i));
+        const auto frame_va = static_cast<unsigned>(frame);
+        // Only frames inside the 32-bit exe image map to module RVAs; others
+        // (DLLs / the MinHook trampoline) are logged absolute-only.
+        const bool in_module = frame >= kModuleBase && frame < 0x00800000;
+        WFH_WARN("diag", "  frame[%u] VA=0x%X RVA=%s0x%X", static_cast<unsigned>(i), frame_va,
+                 in_module ? "" : "(extern) ",
+                 in_module ? static_cast<unsigned>(frame - kModuleBase) : frame_va);
+    }
+
+    // Call through to the original so the game's behavior is unchanged (it still
+    // exits). Same ABI/args. The original is noreturn, so this does not return.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto* const orig = reinterpret_cast<void(__cdecl*)(int, int)>(g_app_exit_gracefully_orig);
+    orig(param_1, param_2);
+}
+
+// ---------------------------------------------------------------------------
 // M3.4 render-driver defense.
 //
 // PROBLEM (from the Ghidra trace, verified 2026-06-16): with the head *_Init
@@ -407,6 +475,20 @@ auto InstallRegistryGateBypass() -> bool {
     return true;
 }
 
+// TEMP (M3.7 diagnostic) — remove after diagnosis. Install the App_ExitGracefully
+// backtrace-logging detour. UNLIKE every other head stub, this one CALLS THROUGH,
+// so it passes the real trampoline slot (g_app_exit_gracefully_orig) to
+// InstallDetour. Returns true on success.
+auto InstallAppExitGracefullyDiag() -> bool {
+    if (!InstallDetour(TargetAt(addr::App_ExitGracefully), AsVoidPtr(&Stub_App_ExitGracefully),
+                       &g_app_exit_gracefully_orig)) {
+        WFH_FATAL("diag", "M3.7: failed to install App_ExitGracefully diagnostic detour");
+        return false;
+    }
+    WFH_INFO("diag", "M3.7 diagnostic detour installed: App_ExitGracefully (logs + calls through)");
+    return true;
+}
+
 }  // namespace
 
 auto InstallHeadStubs() -> bool {
@@ -456,6 +538,13 @@ auto InstallHeadStubs() -> bool {
     // render driver, so the boot does not hit the "no usable display mode" error
     // box and later DAT_00677e54 dispatches land on no-op thunks.
     if (!InstallRenderDriverDefense()) {
+        return false;
+    }
+
+    // TEMP (M3.7 diagnostic) — remove after diagnosis. Install the
+    // App_ExitGracefully backtrace logger so the boot-exit caller is captured.
+    // It only logs and calls through; it does NOT alter the exit behavior.
+    if (!InstallAppExitGracefullyDiag()) {
         return false;
     }
 

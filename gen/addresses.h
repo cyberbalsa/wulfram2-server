@@ -27,6 +27,7 @@ constexpr std::uint32_t Voice_InitSystem = 0x0048b680;
 constexpr std::uint32_t WebLaunch_SetWorkingDirectory = 0x004a4db0;
 constexpr std::uint32_t Installer_RegisterFileAssociations = 0x004a4180;
 constexpr std::uint32_t Shell_OpenUrlWithDefaultBrowser = 0x004b8f70;
+constexpr std::uint32_t App_ExitGracefully = 0x0041db40;
 
 }  // namespace addr
 }  // namespace wfh

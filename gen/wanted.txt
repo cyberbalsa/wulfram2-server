@@ -19,3 +19,4 @@ Voice_InitSystem
 WebLaunch_SetWorkingDirectory
 Installer_RegisterFileAssociations
 Shell_OpenUrlWithDefaultBrowser
+App_ExitGracefully
