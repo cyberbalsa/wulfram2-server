@@ -2,6 +2,7 @@
 
 #include "wfh/log.hpp"
 #include "wfh/pe_validate.hpp"
+#include "wfh/ready_event.hpp"
 
 #include <array>
 #include <cstddef>
@@ -27,6 +28,12 @@ constexpr std::size_t kErrBufSize = 256;
 // it as wedged. A healthy load completes in milliseconds; 15s tolerates a heavily
 // loaded box without hanging the loader forever on a stuck target.
 constexpr DWORD kRemoteLoadTimeoutMs = 15000;
+
+// Upper bound on how long we wait for the DLL's InitThread to signal "hooks
+// installed" after the DLL is loaded. The DLL does logging + a self-check +
+// MinHook init before signaling; 10s is generous for that while still bounding
+// teardown if InitThread aborts (e.g. self-check failure -> no signal).
+constexpr DWORD kReadyTimeoutMs = 10000;
 
 // Format the most recent Win32 error into "<api> failed (<code>): <message>".
 // Called only on a failure path right after the failing API, so GetLastError()
@@ -91,6 +98,31 @@ auto FailInject(PROCESS_INFORMATION& proc_info, LPVOID remote, std::string err) 
     WFH_FATAL("loader", "%s", err.c_str());
     DestroyProcess(proc_info, remote);
     return {false, 0, std::move(err)};
+}
+
+// Ready handshake: after the DLL is loaded but BEFORE the game's main thread is
+// resumed, wait for the DLL's InitThread to signal "hooks installed". The thread
+// is STILL SUSPENDED here, so resuming before the signal would let the game's own
+// init race past the head *_Init detours. The DLL signals a manual-reset event
+// keyed by the PID; we create-or-open it by name (idempotent) and wait. On
+// timeout/failure (e.g. the DLL self-check failed and InitThread aborted without
+// signaling) we tear the still-suspended process down rather than ship a
+// half-hooked game. The event handle is closed on every path.
+auto WaitForReady(PROCESS_INFORMATION& proc_info) -> LaunchResult {
+    const std::wstring ready_name = ReadyEventName(proc_info.dwProcessId);
+    HANDLE ready = CreateEventW(nullptr, TRUE /*manual reset*/, FALSE, ready_name.c_str());
+    if (ready == nullptr) {
+        return FailInject(proc_info, nullptr, LastErrorMessage("CreateEventW(ready)"));
+    }
+    const DWORD ready_wait = WaitForSingleObject(ready, kReadyTimeoutMs);
+    CloseHandle(ready);
+    if (ready_wait != WAIT_OBJECT_0) {
+        WFH_FATAL("loader", "DLL InitThread did not signal ready (wait=%lu)", ready_wait);
+        DestroyProcess(proc_info, nullptr);
+        return {false, 0, "DLL InitThread did not signal ready"};
+    }
+    WFH_INFO("loader", "DLL signaled ready; hooks installed");
+    return {true, 0, {}};
 }
 
 // Allocate a buffer in the target, write the DLL path into it, then run
@@ -214,6 +246,13 @@ auto LaunchAndInject(const InjectionPlan& plan) -> LaunchResult {
     auto injected = InjectDll(proc_info, plan);
     if (!injected.ok) {
         return injected;
+    }
+
+    // --- Ready handshake: wait for the DLL to install its hooks (still suspended) ---
+    // On failure WaitForReady has already torn the process down.
+    auto ready = WaitForReady(proc_info);
+    if (!ready.ok) {
+        return ready;
     }
 
     // Injection succeeded (remote alloc already freed): let the game run. A failed

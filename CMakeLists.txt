@@ -72,8 +72,11 @@ target_link_libraries(wfh_loader_core PUBLIC wfh_log wfh_pe)
 add_executable(loader src/loader/main.cpp)
 target_link_libraries(loader PRIVATE wfh_loader_core wfh_log)
 
-add_library(wulf_headless SHARED src/dll/dllmain.cpp src/dll/init.cpp)
-target_include_directories(wulf_headless PRIVATE include gen)
+add_library(wulf_headless SHARED
+    src/dll/dllmain.cpp
+    src/dll/init.cpp
+    src/dll/hooks/engine_hooks.cpp)
+target_include_directories(wulf_headless PRIVATE include gen src/dll)
 target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe minhook dbghelp)
 
 add_executable(wfh_tests tests/test_main.cpp)

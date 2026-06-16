@@ -3,6 +3,7 @@
 #include "wfh/injector.hpp"
 #include "wfh/log.hpp"
 #include "wfh/pe_validate.hpp"
+#include "wfh/ready_event.hpp"
 
 // Generated headers (gen/) — proves they compile and carry the right values.
 #include "addresses.h"
@@ -285,6 +286,14 @@ TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {
     const auto r = wfh::ValidateHookSitesInProcess(m);
     EXPECT_FALSE(r.ok);
     EXPECT_NE(r.error.find("unreadable"), std::string::npos);  // must NOT fault the process
+}
+
+TEST(ReadyEvent, NameIsPidKeyedAndStable) {
+    // The loader and DLL must build the IDENTICAL per-PID event name for the ready
+    // handshake; this pins the exact format both sides depend on.
+    EXPECT_EQ(wfh::ReadyEventName(1234), std::wstring(L"Local\\WulfHeadlessReady_1234"));
+    EXPECT_EQ(wfh::ReadyEventName(0), std::wstring(L"Local\\WulfHeadlessReady_0"));
+    EXPECT_NE(wfh::ReadyEventName(1), wfh::ReadyEventName(2));
 }
 
 TEST(EngineAbi, TypedefsResolveFromGeneratedAddresses) {
