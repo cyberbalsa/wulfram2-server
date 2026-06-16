@@ -73,8 +73,19 @@ Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md
       event; loader waits 10s + tears down before `ResumeThread`). Commit `89abbe3`. 16/16 ctest.
 - [x] **M3.3** — 11 head-seam no-op detours, ABI-correct (incl. `__thiscall`→`__fastcall`+dummy-EDX and
       `__fastcall` Snd), **verified via dumpbin disasm** (`ret 4`/bare `ret`/register reads). Commit `c85dfcd`.
-- [ ] **M3.4** — render-driver vtable defense (short-circuit `Render_SwitchActiveDriver` / non-null stub). *(next)*
-- [ ] **M3.5** — headless-boot integration smoke (reach loop seam, zero AVs, no head devices).
+- [x] **M3.4** — render-driver defense: detour `Render_SwitchActiveDriver` to install a non-null no-op
+      driver object into `DAT_00677e54` (no-op vtable/thunks) + return 1. Commit `390677b`. Correct per RE,
+      but not yet exercised at runtime (blocked upstream — see M3.5). Temp loop-seam observation detour: `ae4df20`.
+- [⚠] **M3.5** — headless-boot smoke: head-chop machinery VERIFIED working (all 11 stubs install, handshake
+      completes, game resumes, `Winsys_InitGlideRenderer` stubbed cleanly) — but boot is **BLOCKED before the
+      loop seam by an environmental registry-permission wall**: the game requires write access to
+      `HKCU\Software\Wulfram` / `HKEY_USERS\.DEFAULT` on first run (`Cfg_RegOpenOrCreateSubkey @ 0x47e0e2` via
+      `WebLaunch_SetWorkingDirectory @ 0x4a4db0`, early in `Client_Main`, before the render path). No AV.
+      Notes: `docs/superpowers/notes/2026-06-16-m3-headless-boot.md`. Commit `91b30e8`.
+      **DECISION NEEDED** to unblock: (a) stub/bypass the registry-config call in our DLL [recommended — a headless
+      server doesn't need the client registry], (b) pre-seed the registry keys, or (c) one-time elevated run.
+      Also flagged: Windows Defender quarantined `loader.exe` once (DLL-injection heuristic); a project-folder
+      exclusion resolved it.
 - Deferred to follow-on plans: **M3** head chop, **M4** loop hijack + fixed timestep + SEH,
   **M5** Net object + sessions, **M6** physics drive, **M7** multi-client + game rules.
 
