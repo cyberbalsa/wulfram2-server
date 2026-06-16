@@ -1,0 +1,51 @@
+#!/bin/sh
+# pre-push: THE HARD QUALITY GATE.
+#
+# Always runs the FULL gate regardless of which refs are being pushed. git
+# feeds the ref list on stdin; we intentionally ignore it.
+#
+#   1. build.ps1  -> cmake configure + build under /W4 /WX (zero warnings or
+#                    the build FAILS) + ctest. Tests are therefore part of the
+#                    push gate.
+#   2. lint.ps1   -> clang-tidy (WarningsAsErrors '*') + cppcheck
+#                    (--error-exitcode=1) over src/ + include/.
+#
+# Either failing blocks the push. Activate (every clone, once):
+#   git config core.hooksPath .githooks
+#
+# Bypass in an emergency (discouraged, must not be routine):
+#   git push --no-verify
+set -u
+
+# Drain stdin (the <local-ref> <local-sha> <remote-ref> <remote-sha> lines) so
+# we are not relying on it; the gate is unconditional.
+cat >/dev/null 2>&1 || true
+
+# Run from the repo root so the ./*.ps1 relative paths resolve.
+ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$ROOT" || exit 1
+
+# build.ps1 / lint.ps1 use PowerShell 7+ syntax (e.g. the ?. operator), so
+# prefer pwsh when present; fall back to Windows PowerShell (powershell.exe).
+if command -v pwsh >/dev/null 2>&1; then
+    PS="pwsh"
+else
+    PS="powershell.exe"
+fi
+
+echo "==> pre-push quality gate: build + tests (/W4 /WX)"
+"$PS" -NoProfile -ExecutionPolicy Bypass -File ./build.ps1
+if [ $? -ne 0 ]; then
+    echo "PUSH BLOCKED: build/tests failed (zero-warning /W4 /WX gate)" >&2
+    exit 1
+fi
+
+echo "==> pre-push quality gate: static analysis (clang-tidy + cppcheck)"
+"$PS" -NoProfile -ExecutionPolicy Bypass -File ./lint.ps1
+if [ $? -ne 0 ]; then
+    echo "PUSH BLOCKED: static analysis (clang-tidy/cppcheck) failed" >&2
+    exit 1
+fi
+
+echo "QUALITY GATE PASSED"
+exit 0

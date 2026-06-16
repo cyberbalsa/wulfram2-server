@@ -1,0 +1,48 @@
+#!/bin/sh
+# pre-commit: FAST gate. clang-format check on STAGED C/C++ files only.
+#
+# Deliberately light: NO build, NO clang-tidy/cppcheck here (those run in
+# pre-push). This only enforces that staged sources are clang-format clean so
+# the heavy push gate is never tripped by trivial formatting.
+#
+# Activate (every clone must do this once):
+#   git config core.hooksPath .githooks
+#
+# Bypass in an emergency (discouraged): git commit --no-verify
+set -u
+
+CLANG_FORMAT="/c/Program Files/LLVM/bin/clang-format.exe"
+
+# Collect staged, still-present C/C++ files (Added/Copied/Modified).
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(cpp|hpp|h)$' || true)
+
+if [ -z "$staged" ]; then
+    exit 0  # no C/C++ staged: nothing to check, stay fast
+fi
+
+if [ ! -x "$CLANG_FORMAT" ] && [ ! -f "$CLANG_FORMAT" ]; then
+    echo "pre-commit: clang-format not found at: $CLANG_FORMAT" >&2
+    echo "pre-commit: install LLVM or fix the path, then retry." >&2
+    exit 1
+fi
+
+bad=""
+for f in $staged; do
+    # --dry-run -Werror exits non-zero if the file is not already formatted.
+    if ! "$CLANG_FORMAT" --dry-run -Werror "$f" >/dev/null 2>&1; then
+        bad="$bad $f"
+    fi
+done
+
+if [ -n "$bad" ]; then
+    echo "pre-commit BLOCKED: the following files are not clang-format clean:" >&2
+    for f in $bad; do
+        echo "  $f" >&2
+    done
+    echo "" >&2
+    echo "Fix with: \"$CLANG_FORMAT\" -i$bad" >&2
+    echo "(then re-stage and commit). Bypass with --no-verify only in emergencies." >&2
+    exit 1
+fi
+
+exit 0

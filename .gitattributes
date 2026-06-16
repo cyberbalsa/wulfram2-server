@@ -1,0 +1,5 @@
+# Git hook scripts run under Git Bash (sh) and must keep LF line endings so the
+# #!/bin/sh shebang and the script body parse correctly on every clone,
+# regardless of the user's core.autocrlf setting.
+.githooks/pre-commit text eol=lf
+.githooks/pre-push   text eol=lf
