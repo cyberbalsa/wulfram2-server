@@ -155,3 +155,45 @@ TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {
     EXPECT_FALSE(r.ok);
     EXPECT_NE(r.error.find("unreadable"), std::string::npos);  // must NOT fault the process
 }
+
+TEST(Injector, RejectsWrongBinaryBeforeSpawning) {
+    // A PE whose stamps do NOT match kBinaryManifest must be rejected by the pinning gate,
+    // and LaunchAndInject must return !ok WITHOUT creating a process.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "wfh_inject_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto fake_exe = dir / "wulfram2.exe";
+    // minimal PE32 with deliberately-wrong TimeDateStamp (0xDEADBEEF != real stamp)
+    {
+        std::vector<unsigned char> buf(0x200, 0);
+        buf[0] = 'M';
+        buf[1] = 'Z';
+        const std::uint32_t e_lfanew = 0x80;
+        std::memcpy(&buf[0x3C], &e_lfanew, 4);
+        buf[0x80] = 'P';
+        buf[0x81] = 'E';
+        const std::uint16_t machine = 0x014C;  // I386
+        std::memcpy(&buf[0x84], &machine, 2);
+        const std::uint16_t nsect = 1;
+        std::memcpy(&buf[0x86], &nsect, 2);
+        const std::uint32_t stamp = 0xDEADBEEF;
+        std::memcpy(&buf[0x88], &stamp, 4);
+        const std::uint16_t optsize = 0xE0;
+        std::memcpy(&buf[0x94], &optsize, 2);
+        const std::uint16_t magic = 0x010B;  // PE32
+        std::memcpy(&buf[0x98], &magic, 2);
+        std::ofstream(fake_exe, std::ios::binary)
+            .write(reinterpret_cast<const char*>(buf.data()),  // NOLINT
+                   static_cast<std::streamsize>(buf.size()));
+    }
+    wfh::InjectionPlan plan;
+    plan.game_exe_path = fake_exe;
+    plan.dll_path = fake_exe;  // unused — rejection happens before injection
+    plan.command_line = L"\"" + fake_exe.wstring() + L"\"";
+    const auto r = wfh::LaunchAndInject(plan);
+    EXPECT_FALSE(r.ok);  // pinning rejects wrong build; no process spawned
+    // Confirm the rejection came from the PINNING path (parsed but mismatched),
+    // not a "cannot read PE headers" parse failure.
+    EXPECT_NE(r.error.find("mismatch"), std::string::npos);
+}
