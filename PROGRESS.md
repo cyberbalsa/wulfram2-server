@@ -26,7 +26,9 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
       (hardening: idempotent `Init`, safe `~State` teardown). Both reviews passed.
 - [x] **Task 1.5** — clang-tidy + cppcheck installed; tests migrated to GoogleTest (FetchContent + CTest);
       `lint.ps1` gate (clang-tidy + cppcheck) green. Commits `c4ffa26`, `97ef444`. Verified: ctest 2/2, lint PASS.
-- [ ] **Task 1.6** — Git hooks (`.githooks/` + core.hooksPath): pre-push zero-warning + lint + ctest gate. *(next)*
+- [x] **Task 1.6** — Git hooks (`.githooks/` + `core.hooksPath`): pre-commit clang-format check; pre-push
+      hard gate (build `/W4 /WX` zero-warning + `lint.ps1` + ctest). Verified blocks a warning & a mis-format.
+      Commits `e8b4341`, `5f99f16`. Docs: `docs/quality-gate.md`. (pre-push uses `pwsh`; hooks pinned LF.)
 - [ ] **Task 2** — Loader arg parsing
 - [ ] **Task 3** — PE manifest model + validator
 - [ ] **Task 4** — Injector + loader main
