@@ -86,7 +86,8 @@ add_library(wfh_server_net STATIC
     src/dll/server/net/world_packets.cpp
     src/dll/server/net/connection.cpp
     src/dll/server/net/acceptor.cpp
-    src/dll/server/net/runtime.cpp)
+    src/dll/server/net/runtime.cpp
+    src/dll/server/net/world_host.cpp)
 target_include_directories(wfh_server_net PUBLIC include)
 target_link_libraries(wfh_server_net PUBLIC wfh_proto wfh_log PRIVATE ws2_32)
 
@@ -105,13 +106,15 @@ add_library(wulf_headless SHARED
     src/dll/dllmain.cpp
     src/dll/init.cpp
     src/dll/hooks/engine_hooks.cpp
-    src/dll/hooks/head_stubs.cpp)
+    src/dll/hooks/head_stubs.cpp
+    src/dll/server/world_host_engine.cpp
+    src/dll/server/engine_thunks.cpp)
 target_include_directories(wulf_headless PRIVATE include gen src/dll)
 target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe wfh_proto wfh_server_net
     wfh_server_tick minhook dbghelp)
 
 add_executable(wfh_tests tests/test_main.cpp tests/test_proto.cpp tests/test_server_net.cpp
-    tests/test_server_tick.cpp)
+    tests/test_server_tick.cpp tests/test_world_host.cpp)
 target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_proto wfh_server_net wfh_server_tick
     wfh_loader_core GTest::gtest_main ws2_32)
 gtest_discover_tests(wfh_tests)

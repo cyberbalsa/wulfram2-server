@@ -20,6 +20,10 @@ struct ServerConfig {
     std::uint32_t tick_hz = kDefaultTickHz;         // engine tick cadence (informational)
     std::string map = "bpass";                      // map name advertised in WORLD_STATS
     std::string advertised_udp_host = "127.0.0.1";  // host told to clients for UDP
+    // When set, the tick thread directly hosts the engine world (M5.4: reset
+    // session -> load map -> game mode -> spawn) so the engine owns + ticks the
+    // world. Default off so the verified MVP/self-connection path is unchanged.
+    bool world_host = false;
 };
 
 // Parse the [server] keys (bind_port, tick_hz, map) from headless.toml contents.

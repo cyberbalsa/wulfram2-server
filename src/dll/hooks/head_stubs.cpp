@@ -2,6 +2,8 @@
 
 #include "engine_hooks.hpp"
 
+#include "server/world_host_engine.hpp"
+
 #include "wfh/log.hpp"
 #include "wfh/server/tick_guard.hpp"
 #include "wfh/server/world_packets.hpp"
@@ -432,9 +434,10 @@ void __cdecl ServerTickBody(void* /*user*/) {
     // the server's session key we drive its own key-echo sender. On the engine main
     // thread (this detour runs inside Net_ServiceConnection), so it is ABI-/thread-safe.
     static bool s_drove_key_echo = false;
-    // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
+    // NOLINTBEGIN(clang-analyzer-core.FixedAddressDereference)
     const auto engine_key_recv =
         *static_cast<volatile std::uint8_t*>(TargetAt(kEngineKeyRecvFlagVA));
+    // NOLINTEND(clang-analyzer-core.FixedAddressDereference)
     if (!s_drove_key_echo && engine_key_recv == 1) {
         WFH_INFO("tick", "self-connection: engine has session key; driving Net_SendHelloName");
         // Net_SendHelloName is void __stdcall(void); TargetAt yields its entry point.
@@ -445,6 +448,11 @@ void __cdecl ServerTickBody(void* /*user*/) {
 
     server::ProcessMvpOnlineTick(
         static_cast<std::uint32_t>(g_guarded_tick.load(std::memory_order_relaxed)));
+
+    // M5.4: when [server] world_host is set, drive the engine's own world-entry
+    // (reset -> load map -> game mode -> spawn) so the engine owns + ticks the world.
+    // Runs on the engine main thread inside this SEH-guarded tick. No-op otherwise.
+    server::ProcessWorldHostTick();
 }
 
 // Detour for Net_ServiceConnection (void __stdcall). Calls the engine's real net pump

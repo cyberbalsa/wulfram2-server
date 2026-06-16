@@ -226,6 +226,43 @@ Two evidenced fixes after a live rendering-client smoke + full Ghidra RE of the 
   LOGIN (0x21 user/pass) to reach in-game so the engine owns the world. Added verbose UDP/TCP hex
   wire logging (DEBUG).
 
+### ✅ M5.4-min(a) — direct world-host: engine loads + ticks its own world headless (2026-06-16)
+**Decision (user):** pursue **direct in-process world hosting** ("trick the game into game mode")
+over the self-connection-login path — call the engine's own world-entry directly on the tick thread.
+See `memory/m5-direct-world-host.md`. Achieved: the headless engine resets its session and loads the
+`bpass` world; its main loop then ticks the engine's OWN physics on the loaded world (no reimplemented
+sim, no local player/camera).
+- **TDD (host-tested):** `WorldBootstrap` — a pure sequencing state machine (Idle → Reset → Load →
+  Spawn → Complete, one engine action per tick), mirroring the `Connection` "pure brain" pattern;
+  + a `world_host` config flag (`[server]`, default OFF). 11 new gtests (sequence/idempotence/parse).
+  Build = **91/91 CTest**, `lint.ps1` = **PASS**.
+- **Engine glue (DLL, SEH-guarded tick):** `ProcessWorldHostTick` runs `Game_ResetSession(0)` →
+  `Client_SetCurrentWorld(bpass)` after a settle delay. **SpawnEntity is a logged placeholder** —
+  deferred to M5.4-min(b) (needs verified asm register-handoff wrappers).
+- **"Game mode" = world loaded (evidence-based):** the engine's own `Net_HandleWorldStats @ 0x46cf50`
+  does exactly `Game_ResetSession(0)` + `Client_SetCurrentWorld(...)` with **no** screen-mode flip;
+  physics ticks in `Interp_UpdateAllEntities` the moment `DAT_006785e4 != 0`. So the separate
+  `Screen_SwitchMode(3)` step was dropped — the screen-mode enum is the local rendering client's
+  camera/HUD, which a headless server has no use for.
+- **Root-caused a hang (systematic debugging + cdb):** a first smoke froze the engine thread inside
+  `Client_SetCurrentWorld`. `cdb -p <pid> -c "~*kn"` showed the stuck stack was in **our DLL**:
+  `_RTC_CheckEsp → _CrtDbgReportW → MessageBoxW` — an `/RTC1` ESP-mismatch modal dialog. Cause:
+  `Client_SetCurrentWorld` is **NOT `__fastcall`** (Ghidra mislabels it). True convention, verified
+  from its own call site: **ECX=worldFlag, EDX=map, stack=[worldType, seed], caller-cleans 8**
+  (plain `RET`). A `__fastcall` cast left an 8-byte ESP imbalance → RTC dialog → deadlock. Fixed with
+  a `__declspec(naked)` asm thunk (`src/dll/server/engine_thunks.cpp`); that one x86-asm file is
+  excluded from clang-tidy (the host x64 triple rejects `naked`); cppcheck still covers it.
+  See `memory/client-setcurrentworld-abi.md`.
+- **Smoke (injected, controller-run, cleaned up):** world-host bootstrap completes
+  (`Game_ResetSession` → `Client_SetCurrentWorld` → **world loaded** → bootstrap complete); process
+  stable, loop ticks `t63 → 346+`, no crash/fault. **Verified live via cdb:** `DAT_006785e4` =
+  `0x0945a3d0` (world map **non-null** → loaded) and `DAT_00677f34` (OidTable) non-null (ready for
+  spawns). Repo `config/headless.toml` stays `world_host` OFF; smoke used the build copy.
+- **Next (M5.4-min(b)):** asm register-handoff thunks for `Obj_Create` (OID in EBX) +
+  `Obj_InitFromSpawn` (entity in EAX) to spawn ONE entity into the loaded world (leave
+  `DAT_005b83e0 = -1` so no local-camera grab), confirm it lands in `DAT_006785e4` + spatial index,
+  run ticks → predictable motion. Then read entity structs back → M6.1 authoritative relay.
+
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites

@@ -60,6 +60,19 @@ void SetIfPresent(std::string& target, std::string_view value) {
     }
 }
 
+// Interpret a config value as a boolean. "true"/"1" -> true, "false"/"0" -> false;
+// anything else keeps the fallback. Case-sensitive lowercase, matching the rest of
+// the parser's bare-token convention.
+auto ParseBool(std::string_view text, bool fallback) -> bool {
+    if (text == "true" || text == "1") {
+        return true;
+    }
+    if (text == "false" || text == "0") {
+        return false;
+    }
+    return fallback;
+}
+
 void ApplyServerKey(ServerConfig& cfg, std::string_view line) {
     if (KeyIs(line, "bind_port")) {
         const std::uint32_t port = ParseU32(ValueOf(line), cfg.bind_port);
@@ -72,6 +85,8 @@ void ApplyServerKey(ServerConfig& cfg, std::string_view line) {
         SetIfPresent(cfg.map, ValueOf(line));
     } else if (KeyIs(line, "advertised_udp_host")) {
         SetIfPresent(cfg.advertised_udp_host, ValueOf(line));
+    } else if (KeyIs(line, "world_host")) {
+        cfg.world_host = ParseBool(ValueOf(line), cfg.world_host);
     }
 }
 

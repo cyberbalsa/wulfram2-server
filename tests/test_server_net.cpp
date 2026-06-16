@@ -323,6 +323,22 @@ TEST(ServerConfig, IgnoresKeysOutsideServerSection) {
     EXPECT_EQ(cfg.map, "bar");
 }
 
+TEST(ServerConfig, WorldHostDefaultsOff) {
+    const auto cfg = ParseServerConfig("[server]\nmap = bar\n");
+    EXPECT_FALSE(cfg.world_host);
+}
+
+TEST(ServerConfig, ParsesWorldHostTrue) {
+    const auto cfg = ParseServerConfig("[server]\nworld_host = true\n");
+    EXPECT_TRUE(cfg.world_host);
+}
+
+TEST(ServerConfig, ParsesWorldHostNumericAndFalse) {
+    EXPECT_TRUE(ParseServerConfig("[server]\nworld_host = 1\n").world_host);
+    EXPECT_FALSE(ParseServerConfig("[server]\nworld_host = false\n").world_host);
+    EXPECT_FALSE(ParseServerConfig("[server]\nworld_host = 0\n").world_host);
+}
+
 // --- Bring-up packets ------------------------------------------------------
 
 TEST(BringupPackets, HelloVersionCarriesProtocolVersion) {
