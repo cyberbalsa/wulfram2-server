@@ -12,9 +12,43 @@ struct TestFailure : std::exception {
     if (!condition) throw TestFailure(message);
 }
 
+#include "wfh/log.hpp"
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+static std::string ReadAll(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    std::ostringstream ss; ss << in.rdbuf(); return ss.str();
+}
+
+void test_log_writes_to_file_and_respects_level() {
+    const auto dir = std::filesystem::temp_directory_path() / "wfh_log_test";
+    std::filesystem::remove_all(dir);
+    const auto file = dir / "headless.log";
+
+    wfh::Log::Init(file, wfh::Level::Info);   // min level Info: Debug must be dropped
+    WFH_LOG(wfh::Level::Debug, "net", "this should NOT appear %d", 1);
+    WFH_LOG(wfh::Level::Warn,  "net", "client %d joined", 7);
+    wfh::Log::Shutdown();                     // flushes synchronously
+
+    const std::string contents = ReadAll(file);
+    Expect(contents.find("client 7 joined") != std::string::npos, "warn line missing");
+    Expect(contents.find("should NOT appear") == std::string::npos, "debug line leaked below min level");
+    Expect(contents.find("[WARN]") != std::string::npos, "level tag missing");
+    Expect(contents.find("net") != std::string::npos, "category missing");
+}
+
 int main() {
     int failures = 0;
-    // Tests are registered below in later tasks.
+    struct Case { const char* name; void(*fn)(); };
+    const Case cases[] = {
+        {"log_writes_to_file_and_respects_level", test_log_writes_to_file_and_respects_level},
+    };
+    for (const auto& c : cases) {
+        try { c.fn(); std::cout << "  ok   " << c.name << "\n"; }
+        catch (const std::exception& e) { ++failures; std::cout << "  FAIL " << c.name << ": " << e.what() << "\n"; }
+    }
     std::cout << "wfh_tests: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }
