@@ -1,0 +1,20 @@
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  modernize-*
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*wfh.*'
+FormatStyle: file
+CheckOptions:
+  - key: readability-identifier-length.MinimumVariableNameLength
+    value: '2'
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '25'
+  - key: modernize-use-trailing-return-type.StrictMode
+    value: 'false'
