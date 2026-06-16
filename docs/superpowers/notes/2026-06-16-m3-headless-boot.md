@@ -160,3 +160,187 @@ empty. No lingering `wulfram2` (or `loader`) process remains.
   No access violation was observed up to the gate.
 ```
 
+---
+
+## Registry bypass + re-run (2026-06-16, commit `c39ff99`)
+
+Implemented the in-DLL bypass of the first-run registry gate and re-ran the smoke.
+**The registry gate is now passed** (no MessageBox). The boot advances further but
+**still does not reach `Client_RunMainLoop`** — a NEW blocker appears: the game
+exits cleanly (exit code 0) early in input bring-up, with no error box and no
+access violation.
+
+### RE — choosing the stub point
+
+Decompiled both candidates in Ghidra (program `wulfram2.exe`):
+
+- `Cfg_RegOpenOrCreateSubkey` (entry `0x0047e040`; box at `0x0047e0e2`):
+  `void __fastcall(char* subkeyName)`. Does **not** return a status; it writes the
+  opened `HKEY` back into its caller object at `EDI+0x10` (out-param via a
+  register-passed `this`). Stubbing it to "success" would leave that HKEY stale and
+  break callers (`Cfg_GetLocationOrDefault`, the `Cfg_RegSetStringValue` chain).
+  **Rejected as the stub point** — it is a shared leaf with a live out-param.
+- `WebLaunch_SetWorkingDirectory` (`0x004a4db0`): `void __cdecl(void)` (verified by
+  disassembly — no params, bare `ret`, caller-clean). Self-contained: opens
+  `HKCU\Software\Wulfram`, `Cfg_GetLocationOrDefault`, `__chdir`. `Client_Main`
+  reads no global that only this sets. **Safe to no-op.**
+
+Crucial correction to the prior section: the **observed `.DEFAULT` access-denied
+box does NOT come from `WebLaunch_SetWorkingDirectory`** (which only ever opens
+`HKEY_CURRENT_USER`). It comes from **`Installer_RegisterFileAssociations`
+(`0x004a4180`)**, called from `Cmd_ResolveStartupArgs (0x004183a0)`, which runs in
+`Client_Main` **before** `WebLaunch_SetWorkingDirectory`. That function registers
+`.w2l` file associations, MIME types, App Paths, and the **Netscape Navigator URL
+handlers (Suffixes/Viewers)** under HKCU **and `HKEY_USERS\.DEFAULT`** — the latter
+is exactly the root in the error text, and an unprivileged account cannot create
+it. Its ABI: Ghidra types it `__fastcall(char*)` with the one arg in ECX (prologue
+`MOV ESI,ECX`), return value unused by its caller, bare `ret` epilogue.
+
+**Decision:** stub BOTH self-contained callers (not the shared leaf). Each is a
+side-effecting step whose result `Client_Main` never reads back, and a headless
+server needs neither OS file associations / Netscape handlers nor the client's HKCU
+install-dir config.
+
+### Implementation
+
+- Detours in `head_stubs.cpp`, installed in `InstallHeadStubs()` via
+  `InstallRegistryGateBypass()` (live before the game resumes, through the existing
+  handshake):
+  - `Stub_Installer_RegisterFileAssociations` — `__fastcall(char* ECX, int EDX
+    dummy) -> void`, the standard MinHook `__fastcall` shim (same pattern as
+    `Stub_Snd_InitDevice`); zero stack args => bare-`ret` callee cleanup matches.
+  - `Stub_WebLaunch_SetWorkingDirectory` — `__cdecl() -> void` no-op.
+  - Both log `WFH_DEBUG("hook","bypassed <name>")`.
+- `gen/{known_addresses.tsv,wanted.txt,hook_sites.txt}` gained both names;
+  regenerated with `--hook-bytes 16`. `site_count` rose **13 -> 15**; the
+  `GeneratedHeaders` assert was updated to `15u`.
+- `.\build.ps1` green (16/16 ctest), `.\lint.ps1` PASS (clang-tidy + cppcheck
+  clean), clang-format clean.
+
+### Re-run progression (build\logs\headless.log)
+
+```
+... all 11 head stubs install; M3.4 + loop observation detours install ...
+[INFO][init]  signaled ready / foundation ready; head seams stubbed
+[DEBUG][head] stubbed Winsys_InitGlideRenderer
+[DEBUG][hook] bypassed Installer_RegisterFileAssociations   <-- registry gate #1 passed
+[DEBUG][hook] bypassed WebLaunch_SetWorkingDirectory        <-- registry gate #2 passed
+[DEBUG][head] stubbed DirectInput_InitJoystick              <-- last line; further than before
+```
+
+- **Registry gate: PASSED.** Both bypass detours fire; **no MessageBox**
+  (`MainWindowTitle` empty throughout — previously it was `"Error"`).
+- **Reached the M3.4 render defense? Not observed.** The
+  `M3.4: Render_SwitchActiveDriver short-circuited` line does not appear in the
+  (flushed) log before the process exits.
+- **Reached the loop seam? No.** `reached Client_RunMainLoop — head-chop OK` was
+  never written.
+
+### New blocker
+
+The `wulfram2.exe` process **exits on its own with exit code 0** (captured via
+`Process.WaitForExit`/`ExitCode`) shortly after `stubbed DirectInput_InitJoystick`.
+No error MessageBox, no access violation (exit code is `0`, not `0xC0000005`), and
+**no Windows Error Reporting / Application Error event** is logged. This is a clean,
+graceful early exit — consistent with an `App_ExitGracefully(0,0)` / `_exit(0)`
+path early in `Client_Main` (e.g. the `Net_RunAutoUpdater()` step, or the
+`Shell_OpenUrlWithDefaultBrowser(...)` + `App_ExitGracefully(0,0)` branch), rather
+than a crash.
+
+Caveat: the logger drains on a background worker thread (`DrainOnce` on a poll
+interval, final flush in `WorkerMain`). On an abrupt process exit the tail of the
+queue may not flush, so the last logged line is a lower bound on progress, not
+necessarily the true exit point — the exact exit call is not captured in the log.
+**Per the M3 task guidance, this NEW blocker is reported, not guess-fixed**
+(it is not an ABI problem — the detours fire correctly and the process exits
+cleanly). Recommended next step: RE the early-boot exit path (`Net_RunAutoUpdater`
+and the `App_ExitGracefully` branches in `Client_Main`) and/or attach a debugger
+to break on `App_ExitGracefully` / `_exit` to find which condition triggers the
+graceful exit headless.
+
+### Cleanup confirmation
+
+Every re-run used a try/finally whose `finally` ran `Stop-Process -Name wulfram2
+-Force -EA SilentlyContinue`. After each run `Get-Process -Name wulfram2` was empty
+— no lingering process.
+
+---
+
+## M3.5b — "open browser then quit" branch (2026-06-16, commit `27291c9`)
+
+The clean exit-0 above was diagnosed: the user observed the **default browser open
+to wulfram.com** during the run. Traced to a branch in `Client_Main @ 0x00418872`:
+
+```c
+if (DAT_00677f4a == 0 && DAT_00679123 != 0 && DAT_00677f48 == 0) {
+    Shell_OpenUrlWithDefaultBrowser(DAT_00679160);  // WinExec browser -> wulfram.com
+    App_ExitGracefully(0, 0);                        // NORETURN: _exit(0)
+}
+```
+
+`Shell_OpenUrlWithDefaultBrowser (0x004b8f70)` reads `HKCR\http\shell\open\command`
+and `WinExec`s the browser with the URL; `App_ExitGracefully (0x0041db40)` is a
+full-shutdown routine ending in `_exit()`. In the headless config `DAT_00679123` is
+non-zero (set by the client init/reset-globals), so the branch was taken: browser +
+graceful exit.
+
+### Fix (committed)
+
+- Detour `Shell_OpenUrlWithDefaultBrowser` → no-op (`void __cdecl(void* url)`,
+  caller-clean). **No browser is ever launched** — covers both this branch and the
+  second call site inside `App_ExitGracefully` (which also opens a URL when
+  `DAT_00677f48 != 0`).
+- Clear the branch guard `DAT_00679123 = 0` from the existing
+  `Stub_WebLaunch_SetWorkingDirectory` (which runs immediately before the branch),
+  so `App_ExitGracefully(0,0)` is never reached. The Ghidra xref shows `DAT_00679123`
+  is **read in exactly one place** (the branch guard at `0x00418872`) with no other
+  consumer, so forcing it to 0 is side-effect-free. `App_ExitGracefully` itself is
+  intentionally NOT detoured: it is `noreturn` and the legitimate shutdown path, so
+  neutralizing it globally would be unsafe — skipping the branch is the surgical fix.
+- `Shell_OpenUrlWithDefaultBrowser` added to the gen inputs; regenerated
+  (`--hook-bytes 16`); `site_count` 15 → 16, `GeneratedHeaders` assert updated to
+  `16u`. `InstallRegistryGateBypass` was refactored table-driven (3 entries) to stay
+  under the cognitive-complexity lint gate. build green (16/16), lint PASS.
+
+### Re-run progression (build\logs\headless.log)
+
+```
+... head stubs / M3.4 / loop observation detours install ...
+[DEBUG][head] stubbed Winsys_InitGlideRenderer
+[DEBUG][hook] bypassed Installer_RegisterFileAssociations
+[DEBUG][hook] bypassed WebLaunch_SetWorkingDirectory; cleared boot-exit branch guard
+[DEBUG][head] stubbed DirectInput_InitJoystick
+[DEBUG][hook] bypassed Shell_OpenUrlWithDefaultBrowser (no browser launch)
+```
+
+- **Browser launch: STOPPED** (the user's report). `Shell_OpenUrlWithDefaultBrowser`
+  is intercepted and no-op'd; no browser window opens, `MainWindowTitle` empty.
+- The early `Client_Main` branch is no longer the cause (guard cleared). The
+  `Shell_OpenUrlWithDefaultBrowser` interception now logs AFTER
+  `DirectInput_InitJoystick`, i.e. it is reached via **`App_ExitGracefully`'s own
+  URL-open** (`DAT_00677f48 != 0`), not the early branch.
+- **Loop seam: still NOT reached.** `reached Client_RunMainLoop — head-chop OK` not
+  written. The process still exits cleanly (code 0, no box, no AV).
+
+### Remaining blocker (reported, not guess-fixed)
+
+Something still drives the boot into **`App_ExitGracefully`** during startup (after
+the input-init seams). `App_ExitGracefully` has many callers
+(`App_HandleCloseEvent`, `App_RunGameAndExit`, `Client_Main`,
+`Input_HandleKeyDown`, `Login_HandleStatusResponse`, `Net_TearDownConnection`,
+`Winsys_Win32_PumpMessages`); the early `Client_Main` branch is now ruled out. The
+likely culprit is a window-message / close-event path (`Winsys_Win32_PumpMessages`
+/ `App_HandleCloseEvent`) reaching a WM_QUIT/WM_CLOSE because the windowing seams
+are stubbed, or another boot-time condition invoking graceful exit. This is a
+distinct, deeper blocker from the registry gate and the browser launch (both of
+which are now resolved). Per the M3 guidance it is reported rather than
+guess-fixed — neutralizing `App_ExitGracefully` globally is unsafe (it is `noreturn`
+and the real shutdown path). Recommended next step: attach a debugger and set a
+breakpoint on `App_ExitGracefully (0x0041db40)` to capture the call stack and
+identify which caller fires during boot.
+
+### Cleanup confirmation (M3.5b)
+
+Same try/finally cleanup; `WULFRAM2_EXITCODE=0` captured via `Process.ExitCode`;
+after every run `Get-Process -Name wulfram2` was empty. No lingering process.
+
