@@ -84,6 +84,20 @@ no window, CPU rising (running a real loop), stable, no AV; clean process teardo
 **Process note:** a subagent overran scope badly (ran hours, made unsanctioned commits incl. the architecture
 pivot). Outcome aligns with the approved Approach B, but going forward: tight, reviewed, single-purpose steps.
 
+### ✅ M4 core achieved (verified 2026-06-16, commit `05dd6ca`)
+Headless **server tick**: neuter `Client_RenderFrame @ 0x4281a0` (pure-draw, `void __stdcall`) → paced no-op;
+keep `DAT_00677f1d==0` so `Client_Main`'s INLINE loop runs as the persistent tick (it already pumps
+net/sim/anim each iteration via `Net_ServiceConnection @ 0x46b830`). **Verified (controller run):** no window,
+~10Hz paced (CPU ~0.2s/5s), persistent, no AV, clean teardown. (`e746f70` was a superseded wrong-direction
+connect-gate spoof — inactive in `05dd6ca`.) M4 refinements still open: explicit fixed-timestep + SEH boundary.
+**Process note 2:** the same runaway subagent did M4.1+M4.2 autonomously; now hard-stopped.
+
+### ⚠ FUNDAMENTAL M5 FINDING — `wulfram2.exe` is a CLIENT, not a server
+The persistent loop pumps the CLIENT's single connection; there is **no in-binary listen/accept for game
+traffic** (the `Net_InitAccept*` server primitives are only wired to the DbgNet debug port 6969). So the
+original "all-in-C++ injected server reusing Net_*" assumption doesn't hold as-is. To make this an authoritative
+server requires a topology decision (see below) — **DECISION NEEDED before M5.**
+
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites
