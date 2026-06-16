@@ -1,4 +1,4 @@
 // Placeholder loader entry point; real implementation arrives in a later task.
-int wmain() {
+auto wmain() -> int {
     return 0;
 }
