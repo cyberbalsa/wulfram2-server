@@ -13,3 +13,4 @@ Winsys_Input_InitWin32State
 Snd_InitDevice
 WebLaunch_SetWorkingDirectory
 Installer_RegisterFileAssociations
+Shell_OpenUrlWithDefaultBrowser

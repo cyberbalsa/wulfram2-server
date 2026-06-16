@@ -18,3 +18,4 @@ Snd_InitDevice	0x00489fb0
 Voice_InitSystem	0x0048b680
 WebLaunch_SetWorkingDirectory	0x004a4db0
 Installer_RegisterFileAssociations	0x004a4180
+Shell_OpenUrlWithDefaultBrowser	0x004b8f70

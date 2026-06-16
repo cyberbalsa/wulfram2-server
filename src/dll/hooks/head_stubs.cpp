@@ -168,11 +168,50 @@ auto __fastcall Stub_Snd_InitDevice(int* /*self_ecx*/, int /*edx_unused*/) -> in
 // FIX: detour BOTH to no-ops that return immediately without running the
 // originals, so neither registry-write path (and thus neither MessageBox) ever
 // executes.
+//
+// M3.5b — "open browser then quit" boot-exit branch.
+//
+// PROBLEM (observed after the registry gate was cleared; verified in Ghidra):
+// with the registry box gone, the boot ran further but the wulfram2 process then
+// exited cleanly (exit code 0) AND launched the default browser to the Wulfram
+// website. Traced to a branch in Client_Main @ 0x00418872:
+//     if (DAT_00677f4a == 0 && DAT_00679123 != 0 && DAT_00677f48 == 0) {
+//         Shell_OpenUrlWithDefaultBrowser(DAT_00679160);  // browser -> wulfram.com
+//         App_ExitGracefully(0, 0);                        // then _exit(0)
+//     }
+// In our headless config DAT_00679123 is non-zero (set by the client init/reset
+// globals), so this "launch the website then quit" path is taken before the loop
+// seam. Shell_OpenUrlWithDefaultBrowser (0x004b8f70) reads HKCR\http\shell\open\
+// command and WinExec's the browser with the URL; App_ExitGracefully (0x0041db40)
+// is a NORETURN full-shutdown routine ending in _exit().
+//
+// FIX (two parts, both safe):
+//   1. Detour Shell_OpenUrlWithDefaultBrowser -> no-op, so NO browser is ever
+//      launched (covers this branch AND the second call inside App_ExitGracefully).
+//      ABI: void __cdecl(void* url) -- caller-clean; the no-op ignores the arg.
+//   2. Clear the branch guard DAT_00679123 from the WebLaunch_SetWorkingDirectory
+//      stub (which runs immediately before the branch), so App_ExitGracefully is
+//      never reached and the boot continues. DAT_00679123 is read in EXACTLY ONE
+//      place (the Ghidra xref shows a single [READ] at 0x00418872, the branch
+//      guard); it has no other consumer, so forcing it to 0 is side-effect-free.
+//      App_ExitGracefully itself is intentionally NOT detoured: it is noreturn and
+//      is also the legitimate shutdown path, so neutralizing it globally would be
+//      unsafe -- skipping the branch is the surgical fix.
+
+// VA of the boot-exit branch guard (DAT_00679123). Read only at Client_Main
+// 0x00418872; cleared here so the "open browser then quit" branch is not taken.
+// Not in gen/addresses.h (functions only), so pinned as the absolute VA the RE
+// established (same convention as kRenderDriverPtrVA below).
+constexpr std::uint32_t kBootExitBranchGuardVA = 0x00679123;
 
 // void __cdecl(void). Caller-clean, no arguments, no return value. A __cdecl no-op
-// detour matches byte-for-byte (verified: target epilogue is a bare `ret`).
+// detour matches byte-for-byte (verified: target epilogue is a bare `ret`). Also
+// clears the boot-exit branch guard (DAT_00679123) so the immediately-following
+// Client_Main branch does not launch the browser and App_ExitGracefully out.
 auto __cdecl Stub_WebLaunch_SetWorkingDirectory() -> void {
-    WFH_DEBUG("hook", "bypassed WebLaunch_SetWorkingDirectory");
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
+    *static_cast<volatile char*>(TargetAt(kBootExitBranchGuardVA)) = 0;
+    WFH_DEBUG("hook", "bypassed WebLaunch_SetWorkingDirectory; cleared boot-exit branch guard");
 }
 
 // __fastcall(char* cmdline_in_ECX) -> void. Same MinHook __fastcall shim as
@@ -182,6 +221,12 @@ auto __cdecl Stub_WebLaunch_SetWorkingDirectory() -> void {
 auto __fastcall Stub_Installer_RegisterFileAssociations(char* /*cmdline_ecx*/, int /*edx_unused*/)
     -> void {
     WFH_DEBUG("hook", "bypassed Installer_RegisterFileAssociations");
+}
+
+// void __cdecl(void* url) -> void. Caller-clean; the single stack arg is ignored.
+// No-op so the default browser is never launched (the original WinExec's it). M3.5b.
+auto __cdecl Stub_Shell_OpenUrlWithDefaultBrowser(void* /*url*/) -> void {
+    WFH_DEBUG("hook", "bypassed Shell_OpenUrlWithDefaultBrowser (no browser launch)");
 }
 
 // ---------------------------------------------------------------------------
@@ -337,22 +382,28 @@ auto InstallRenderDriverDefense() -> bool {
 // success; logs and returns false on the first MinHook error. The detours never
 // call through, so each trampoline is discarded.
 auto InstallRegistryGateBypass() -> bool {
-    void* original = nullptr;
-    if (!InstallDetour(TargetAt(addr::Installer_RegisterFileAssociations),
-                       AsVoidPtr(&Stub_Installer_RegisterFileAssociations), &original)) {
-        WFH_FATAL("head",
-                  "M3.5: failed to install Installer_RegisterFileAssociations bypass detour");
-        return false;
-    }
-    WFH_INFO("head", "M3.5 bypass detour installed: Installer_RegisterFileAssociations");
+    // M3.5b Shell_OpenUrlWithDefaultBrowser no-ops the browser launch so the "open
+    // website then quit" branch in Client_Main never spawns the default browser;
+    // that branch's graceful exit is separately prevented by clearing DAT_00679123
+    // in the WebLaunch stub.
+    const std::array<HeadStub, 3> bypasses = {{
+        {"Installer_RegisterFileAssociations", TargetAt(addr::Installer_RegisterFileAssociations),
+         AsVoidPtr(&Stub_Installer_RegisterFileAssociations)},
+        {"WebLaunch_SetWorkingDirectory", TargetAt(addr::WebLaunch_SetWorkingDirectory),
+         AsVoidPtr(&Stub_WebLaunch_SetWorkingDirectory)},
+        {"Shell_OpenUrlWithDefaultBrowser", TargetAt(addr::Shell_OpenUrlWithDefaultBrowser),
+         AsVoidPtr(&Stub_Shell_OpenUrlWithDefaultBrowser)},
+    }};
 
-    original = nullptr;
-    if (!InstallDetour(TargetAt(addr::WebLaunch_SetWorkingDirectory),
-                       AsVoidPtr(&Stub_WebLaunch_SetWorkingDirectory), &original)) {
-        WFH_FATAL("head", "M3.5: failed to install WebLaunch_SetWorkingDirectory bypass detour");
-        return false;
+    for (const HeadStub& bypass : bypasses) {
+        // The bypass detours never call through, so the trampoline is discarded.
+        void* original = nullptr;
+        if (!InstallDetour(bypass.target, bypass.detour, &original)) {
+            WFH_FATAL("head", "M3.5: failed to install %s bypass detour", bypass.name);
+            return false;
+        }
+        WFH_INFO("head", "M3.5 bypass detour installed: %s", bypass.name);
     }
-    WFH_INFO("head", "M3.5 bypass detour installed: WebLaunch_SetWorkingDirectory");
     return true;
 }
 

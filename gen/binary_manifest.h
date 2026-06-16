@@ -37,6 +37,8 @@ inline constexpr std::uint8_t kSite_WebLaunch_SetWorkingDirectory[] = {
     0x6a, 0xff, 0x68, 0x58, 0x56, 0x53, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x83, 0xec};
 inline constexpr std::uint8_t kSite_Installer_RegisterFileAssociations[] = {
     0x6a, 0xff, 0x68, 0x00, 0x57, 0x53, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x83, 0xec};
+inline constexpr std::uint8_t kSite_Shell_OpenUrlWithDefaultBrowser[] = {
+    0x55, 0x8b, 0xec, 0x81, 0xec, 0x20, 0x0a, 0x00, 0x00, 0xa1, 0x1c, 0x42, 0x57, 0x00, 0x33, 0xc5};
 
 inline constexpr HookSite kSites[] = {
     {"Client_RunMainLoop", 0x004a0aa0, kSite_Client_RunMainLoop, 16},
@@ -56,9 +58,10 @@ inline constexpr HookSite kSites[] = {
     {"WebLaunch_SetWorkingDirectory", 0x004a4db0, kSite_WebLaunch_SetWorkingDirectory, 16},
     {"Installer_RegisterFileAssociations", 0x004a4180, kSite_Installer_RegisterFileAssociations,
      16},
+    {"Shell_OpenUrlWithDefaultBrowser", 0x004b8f70, kSite_Shell_OpenUrlWithDefaultBrowser, 16},
 };
 
 inline constexpr BinaryManifest kBinaryManifest{0x45254d1f, 0x00288000, 0x001c45a4,
-                                                0x00400000, kSites,     15};
+                                                0x00400000, kSites,     16};
 
 }  // namespace wfh
