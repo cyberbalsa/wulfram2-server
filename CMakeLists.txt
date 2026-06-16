@@ -17,6 +17,10 @@ option(WFH_STRICT "Treat warnings as errors (/WX)" ON)
 option(WFH_ENABLE_CLANG_TIDY "Run clang-tidy during build" OFF)
 option(WFH_MSVC_ANALYZE "Enable MSVC /analyze" OFF)
 
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/config")
+configure_file("${CMAKE_SOURCE_DIR}/config/headless.toml"
+               "${CMAKE_BINARY_DIR}/config/headless.toml" COPYONLY)
+
 include(FetchContent)
 FetchContent_Declare(
     minhook
@@ -73,6 +77,23 @@ add_library(wfh_proto STATIC
     src/dll/server/proto/validate.cpp)
 target_include_directories(wfh_proto PUBLIC include)
 
+# Threaded socket server: WinSock2 listener + per-connection handshake state machine.
+# Engine-isolated (the cardinal rule): it only touches sockets, the proto codec, and
+# the queue boundary — never engine memory.
+add_library(wfh_server_net STATIC
+    src/dll/server/net/server_config.cpp
+    src/dll/server/net/bringup_packets.cpp
+    src/dll/server/net/world_packets.cpp
+    src/dll/server/net/connection.cpp
+    src/dll/server/net/acceptor.cpp
+    src/dll/server/net/runtime.cpp)
+target_include_directories(wfh_server_net PUBLIC include)
+target_link_libraries(wfh_server_net PUBLIC wfh_proto wfh_log PRIVATE ws2_32)
+
+add_library(wfh_server_tick STATIC src/dll/server/tick_guard.cpp)
+target_include_directories(wfh_server_tick PUBLIC include)
+target_link_libraries(wfh_server_tick PUBLIC wfh_log dbghelp)
+
 add_library(wfh_loader_core STATIC src/loader/injector.cpp src/loader/loader_args.cpp)
 target_include_directories(wfh_loader_core PUBLIC include gen)
 target_link_libraries(wfh_loader_core PUBLIC wfh_log wfh_pe)
@@ -86,13 +107,17 @@ add_library(wulf_headless SHARED
     src/dll/hooks/engine_hooks.cpp
     src/dll/hooks/head_stubs.cpp)
 target_include_directories(wulf_headless PRIVATE include gen src/dll)
-target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe wfh_proto minhook dbghelp)
+target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe wfh_proto wfh_server_net
+    wfh_server_tick minhook dbghelp)
 
-add_executable(wfh_tests tests/test_main.cpp tests/test_proto.cpp)
-target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_proto wfh_loader_core GTest::gtest_main)
+add_executable(wfh_tests tests/test_main.cpp tests/test_proto.cpp tests/test_server_net.cpp
+    tests/test_server_tick.cpp)
+target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_proto wfh_server_net wfh_server_tick
+    wfh_loader_core GTest::gtest_main ws2_32)
 gtest_discover_tests(wfh_tests)
 
-set(WFH_TARGETS wfh_log wfh_pe wfh_proto wfh_loader_core loader wulf_headless wfh_tests)
+set(WFH_TARGETS wfh_log wfh_pe wfh_proto wfh_server_net wfh_server_tick wfh_loader_core loader
+    wulf_headless wfh_tests)
 
 if(MSVC)
     foreach(target ${WFH_TARGETS})

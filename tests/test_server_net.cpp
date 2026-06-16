@@ -1,0 +1,1217 @@
+// Tests for the M5.1b threaded socket server: config parsing, bring-up packet
+// framing, the per-connection handshake state machine (in-order accept + adversarial
+// reject), the queue boundary, and a loopback acceptor smoke. Engine-less.
+
+#include "wfh/proto/bitstream.hpp"
+#include "wfh/proto/framing.hpp"
+#include "wfh/proto/opcodes.hpp"
+#include "wfh/server/acceptor.hpp"
+#include "wfh/server/bringup_packets.hpp"
+#include "wfh/server/connection.hpp"
+#include "wfh/server/queues.hpp"
+#include "wfh/server/runtime.hpp"
+#include "wfh/server/server_config.hpp"
+#include "wfh/server/world_packets.hpp"
+
+#include <gtest/gtest.h>
+
+#ifdef _MSC_VER
+#pragma warning(push, 0)
+#endif
+#include <winsock2.h>
+
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using wfh::proto::BitReader;
+using wfh::proto::Frame;
+using wfh::proto::Opcode;
+using wfh::proto::TcpFrameAccumulator;
+using namespace wfh::server;
+
+// Build a TCP frame for `opcode` with a body written by `fn` (BitWriter).
+template <typename Fn> auto MakeFrame(Opcode opcode, Fn fn) -> std::vector<std::uint8_t> {
+    wfh::proto::BitWriter w;
+    fn(w);
+    return wfh::proto::EncodeTcpFrame(static_cast<std::uint8_t>(opcode), w.Bytes()).value();
+}
+
+// Pull the first decoded frame out of a buffer of framed bytes.
+auto FirstFrame(const std::vector<std::uint8_t>& bytes) -> Frame {
+    TcpFrameAccumulator acc;
+    acc.Feed(bytes.data(), bytes.size());
+    auto f = acc.Next();
+    return f.value_or(Frame{});
+}
+
+auto SessionKeyFromHelloBurst(const std::vector<std::uint8_t>& bytes) -> std::string {
+    TcpFrameAccumulator acc;
+    EXPECT_TRUE(acc.Feed(bytes.data(), bytes.size()));
+    while (auto frame = acc.Next()) {
+        if (frame->opcode != static_cast<std::uint8_t>(Opcode::Hello)) {
+            continue;
+        }
+        BitReader r(frame->body.data(), frame->body.size());
+        const auto sub = r.ReadByte();
+        if (sub && *sub == 0x02) {
+            auto key = r.ReadString(256);
+            return key.value_or("");
+        }
+    }
+    return "";
+}
+
+auto MakeRawUdpHelloKeyEcho(const std::string& key) -> std::vector<std::uint8_t> {
+    wfh::proto::BitWriter body;
+    body.WriteByte(0x01);
+    body.WriteString(key);
+    std::vector<std::uint8_t> datagram{static_cast<std::uint8_t>(Opcode::Hello)};
+    const auto bytes = body.Bytes();
+    datagram.insert(datagram.end(), bytes.begin(), bytes.end());
+    return datagram;
+}
+
+auto MakePythonStyleLoginFrame(const std::string& username, const std::string& password)
+    -> std::vector<std::uint8_t> {
+    wfh::proto::BitWriter body_writer;
+    body_writer.WriteByte(0x00);  // login type/subcmd byte; Python skips this before username
+    body_writer.WriteString(username);
+    body_writer.WriteString(password);
+
+    auto body = body_writer.Bytes();
+    body.resize(212, 0);  // observed real-client auto-login LOGIN body size
+    return wfh::proto::EncodeTcpFrame(static_cast<std::uint8_t>(Opcode::Login), body).value();
+}
+
+auto DrainFrames(const std::vector<std::uint8_t>& bytes) -> std::vector<Frame> {
+    TcpFrameAccumulator acc;
+    EXPECT_TRUE(acc.Feed(bytes.data(), bytes.size()));
+    std::vector<Frame> frames;
+    while (auto frame = acc.Next()) {
+        frames.push_back(*frame);
+    }
+    return frames;
+}
+
+auto CountEntitiesInViewUpdate(const Frame& frame) -> std::uint8_t {
+    EXPECT_EQ(frame.opcode, static_cast<std::uint8_t>(Opcode::ViewUpdate));
+    BitReader r(frame.body.data(), frame.body.size());
+    (void)r.ReadI32();  // timestamp
+    (void)r.ReadI32();  // sequence
+    const auto has_stats = r.ReadBool();
+    if (has_stats && *has_stats) {
+        (void)r.ReadBits(5);   // weapon id / padding
+        (void)r.ReadBits(10);  // health
+        (void)r.ReadBits(10);  // energy
+    }
+    const auto count = r.ReadBits(8);
+    return static_cast<std::uint8_t>(count.value_or(0));
+}
+
+auto Fnv1a32(const std::vector<std::uint8_t>& bytes) -> std::uint32_t {
+    constexpr std::uint32_t kFnvOffset = 2166136261U;
+    constexpr std::uint32_t kFnvPrime = 16777619U;
+    std::uint32_t hash = kFnvOffset;
+    for (const std::uint8_t byte : bytes) {
+        hash ^= byte;
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+struct DecodedEntity {
+    std::int32_t net_id = 0;
+    bool is_manned = false;
+    std::uint32_t mask = 0;
+    std::uint32_t unit_type = 0;
+    std::uint32_t team = 0;
+};
+
+void SkipQuantizedVec3(BitReader& reader) {
+    constexpr unsigned kVectorHeaderBits = 4;
+    constexpr unsigned kVectorPayloadBits = 16;
+    (void)reader.ReadBits(kVectorHeaderBits);
+    (void)reader.ReadBits(kVectorPayloadBits);
+    (void)reader.ReadBits(kVectorPayloadBits);
+    (void)reader.ReadBits(kVectorPayloadBits);
+}
+
+auto DecodeEntitiesInViewUpdate(const Frame& frame) -> std::vector<DecodedEntity> {
+    EXPECT_EQ(frame.opcode, static_cast<std::uint8_t>(Opcode::ViewUpdate));
+    BitReader r(frame.body.data(), frame.body.size());
+    (void)r.ReadI32();  // timestamp
+    (void)r.ReadI32();  // sequence
+    const auto has_stats = r.ReadBool();
+    if (has_stats && *has_stats) {
+        (void)r.ReadBits(5);   // weapon id / padding
+        (void)r.ReadBits(10);  // health
+        (void)r.ReadBits(10);  // energy
+    }
+
+    std::vector<DecodedEntity> entities;
+    const auto count = r.ReadBits(8);
+    for (std::uint32_t i = 0; i < count.value_or(0); ++i) {
+        DecodedEntity entity;
+        entity.net_id = r.ReadI32().value_or(0);
+        entity.is_manned = r.ReadBool().value_or(false);
+        entity.mask = r.ReadBits(10).value_or(0);
+        (void)r.ReadBits(16);  // translation bank selector
+        if ((entity.mask & (1U << 0U)) != 0U) {
+            entity.unit_type = r.ReadBits(8).value_or(0);
+            entity.team = r.ReadBits(8).value_or(0);
+            (void)r.ReadBits(8);  // state/subteam
+            if (entity.unit_type == 37U) {
+                (void)r.ReadI32();
+                (void)r.ReadI32();
+            } else if (entity.unit_type == 19U) {
+                (void)r.ReadBits(8);  // cargo contents
+            }
+            (void)r.ReadBool();  // force snap
+        }
+        if ((entity.mask & (1U << 1U)) != 0U) {
+            SkipQuantizedVec3(r);
+        }
+        if ((entity.mask & (1U << 2U)) != 0U) {
+            SkipQuantizedVec3(r);
+        }
+        if ((entity.mask & (1U << 3U)) != 0U) {
+            SkipQuantizedVec3(r);
+        }
+        if ((entity.mask & (1U << 4U)) != 0U) {
+            SkipQuantizedVec3(r);
+        }
+        if ((entity.mask & (1U << 5U)) != 0U) {
+            (void)r.ReadBits(10);
+        }
+        if ((entity.mask & (1U << 7U)) != 0U) {
+            (void)r.ReadBits(10);
+        }
+        if ((entity.mask & (1U << 8U)) != 0U) {
+            (void)r.ReadI32();
+        }
+        entities.push_back(entity);
+    }
+    EXPECT_FALSE(r.Failed());
+    return entities;
+}
+
+auto CountEntitiesMatching(const std::vector<DecodedEntity>& entities, std::uint32_t unit_type,
+                           std::uint32_t team, bool is_manned) -> int {
+    return static_cast<int>(
+        std::count_if(entities.begin(), entities.end(), [=](const DecodedEntity& entity) {
+            return entity.unit_type == unit_type && entity.team == team &&
+                   entity.is_manned == is_manned;
+        }));
+}
+
+auto FirstViewUpdateForSession(const std::vector<OutboundMessage>& messages,
+                               std::uint64_t session_id) -> std::optional<Frame> {
+    for (const OutboundMessage& msg : messages) {
+        if (msg.session_id != session_id) {
+            continue;
+        }
+        const Frame frame = FirstFrame(msg.bytes);
+        if (frame.opcode == static_cast<std::uint8_t>(Opcode::ViewUpdate)) {
+            return frame;
+        }
+    }
+    return std::nullopt;
+}
+
+auto TempMapRoot() -> std::filesystem::path {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto path = std::filesystem::temp_directory_path() / ("wfh_map_test_" + std::to_string(stamp));
+    std::filesystem::create_directories(path);
+    return path;
+}
+
+class ScopedCurrentPath {
+public:
+    explicit ScopedCurrentPath(const std::filesystem::path& path)
+        : original_(std::filesystem::current_path()) {
+        std::filesystem::current_path(path);
+    }
+
+    ~ScopedCurrentPath() {
+        std::error_code ignored;
+        std::filesystem::current_path(original_, ignored);
+    }
+
+    ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+    auto operator=(const ScopedCurrentPath&) -> ScopedCurrentPath& = delete;
+
+private:
+    std::filesystem::path original_;
+};
+
+void WriteTextFile(const std::filesystem::path& path, const std::string& contents) {
+    std::ofstream out(path, std::ios::binary);
+    out << contents;
+}
+
+auto MakeSpawnRequestBody(std::uint16_t sequence, std::int32_t selected_entry_id,
+                          std::int32_t base_id) -> std::vector<std::uint8_t> {
+    wfh::proto::BitWriter writer;
+    writer.WriteU16(sequence);
+    writer.WriteU16(17);
+    writer.WriteByte(0);
+    writer.WriteI32(selected_entry_id);
+    writer.WriteI32(base_id);
+    writer.WriteI32(2000);
+    writer.WriteI32(700);
+    return writer.Bytes();
+}
+
+void ExpectUdpAck(const std::uint8_t* bytes, std::size_t len, std::uint16_t acked_sequence,
+                  std::uint8_t acked_opcode) {
+    ASSERT_EQ(len, 9u);
+    EXPECT_EQ(bytes[0], 0x02);
+    BitReader reader(bytes + 1, len - 1);
+    EXPECT_EQ(reader.ReadU16().value(), 1);
+    EXPECT_EQ(reader.ReadU16().value(), 9);
+    EXPECT_EQ(reader.ReadByte().value(), 1);
+    EXPECT_EQ(reader.ReadByte().value(), acked_opcode);
+    EXPECT_EQ(reader.ReadU16().value(), acked_sequence);
+    EXPECT_FALSE(reader.Failed());
+}
+
+auto MakeTeamRequestBody(std::uint16_t sequence, std::int32_t team_id)
+    -> std::vector<std::uint8_t> {
+    wfh::proto::BitWriter writer;
+    writer.WriteU16(sequence);
+    writer.WriteU16(9);
+    writer.WriteByte(1);
+    writer.WriteI32(team_id);
+    writer.WriteI32(0);
+    return writer.Bytes();
+}
+
+// --- ServerConfig ----------------------------------------------------------
+
+TEST(ServerConfig, ParsesServerSection) {
+    const auto cfg = ParseServerConfig(
+        "[log]\nlevel = \"debug\"\n[server]\nbind_port = 1234\ntick_hz = 30\nmap = \"foo\"\n");
+    EXPECT_EQ(cfg.bind_port, 1234);
+    EXPECT_EQ(cfg.tick_hz, 30u);
+    EXPECT_EQ(cfg.map, "foo");
+}
+
+TEST(ServerConfig, DefaultsWhenMissingOrOutOfRange) {
+    const auto cfg = ParseServerConfig("[server]\nbind_port = 99999\n");  // out of range
+    EXPECT_EQ(cfg.bind_port, 2627);                                       // keeps default
+    EXPECT_EQ(cfg.map, "bpass");
+}
+
+TEST(ServerConfig, IgnoresKeysOutsideServerSection) {
+    const auto cfg = ParseServerConfig("[other]\nbind_port = 1\n[server]\nmap = bar\n");
+    EXPECT_EQ(cfg.bind_port, 2627);
+    EXPECT_EQ(cfg.map, "bar");
+}
+
+// --- Bring-up packets ------------------------------------------------------
+
+TEST(BringupPackets, HelloVersionCarriesProtocolVersion) {
+    const auto bytes = BuildHelloVersion();
+    const Frame f = FirstFrame(bytes);
+    EXPECT_EQ(f.opcode, static_cast<std::uint8_t>(Opcode::Hello));
+    BitReader r(f.body.data(), f.body.size());
+    EXPECT_EQ(r.ReadByte().value(), 0x00);             // subtype VERSION
+    EXPECT_EQ(r.ReadI32().value(), kProtocolVersion);  // 0x4E89
+}
+
+TEST(BringupPackets, UdpConfigRoundTrips) {
+    const auto bytes = BuildHelloUdpConfig(2627, "127.0.0.1");
+    const Frame f = FirstFrame(bytes);
+    BitReader r(f.body.data(), f.body.size());
+    EXPECT_EQ(r.ReadByte().value(), 0x01);  // subtype UDP_CONFIG
+    EXPECT_EQ(r.ReadU16().value(), 2627);   // port
+    EXPECT_EQ(r.ReadU16().value(), 1);      // host count
+    EXPECT_EQ(r.ReadString(256).value(), "127.0.0.1");
+}
+
+TEST(BringupPackets, RosterRoundTrips) {
+    const auto bytes = BuildAddToRoster(7, 1, "player", "tag");
+    const Frame f = FirstFrame(bytes);
+    EXPECT_EQ(f.opcode, static_cast<std::uint8_t>(Opcode::AddToRoster));
+    BitReader r(f.body.data(), f.body.size());
+    EXPECT_EQ(r.ReadI32().value(), 7);  // account id
+    EXPECT_EQ(r.ReadI32().value(), 0);  // metadata
+    EXPECT_EQ(r.ReadU16().value(), 1);  // team
+}
+
+TEST(BringupPackets, TranslationContainsTwentyEightEntries) {
+    const auto bytes = BuildTranslation();
+    const Frame f = FirstFrame(bytes);
+    EXPECT_EQ(f.opcode, static_cast<std::uint8_t>(Opcode::Translation));
+
+    BitReader r(f.body.data(), f.body.size());
+    EXPECT_EQ(r.ReadI32().value(), 16);  // slot 0 header bits
+    EXPECT_EQ(r.ReadI32().value(), 0);   // slot 0 padding
+    EXPECT_EQ(r.ReadI32().value(), 0);   // slot 0 fixed-width total
+    EXPECT_EQ(r.ReadString(64).value(), "1000.0");
+    EXPECT_EQ(r.ReadString(64).value(), "2000.0");
+
+    EXPECT_EQ(r.ReadI32().value(), 5);  // slot 1 weapon id width
+}
+
+TEST(BringupPackets, ViewUpdateSnapshotCarriesTwoTankDefinitions) {
+    std::vector<MvpEntitySnapshot> entities;
+    entities.push_back(MvpEntitySnapshot{1, 0, 1, true, {100.0F, 100.0F, 100.0F}});
+    entities.push_back(MvpEntitySnapshot{2, 0, 2, true, {140.0F, 100.0F, 100.0F}});
+
+    const auto bytes = BuildViewUpdateSnapshot(123, entities, 1.0F, 1.0F);
+    const Frame f = FirstFrame(bytes);
+    EXPECT_EQ(CountEntitiesInViewUpdate(f), 2);
+
+    BitReader r(f.body.data(), f.body.size());
+    EXPECT_EQ(r.ReadI32().value(), 123);  // timestamp
+    EXPECT_EQ(r.ReadI32().value(), 123);  // sequence
+    EXPECT_TRUE(r.ReadBool().value());
+    (void)r.ReadBits(5);
+    (void)r.ReadBits(10);
+    (void)r.ReadBits(10);
+    EXPECT_EQ(r.ReadBits(8).value(), 2);
+
+    EXPECT_EQ(r.ReadI32().value(), 1);  // first entity id
+    EXPECT_TRUE(r.ReadBool().value());
+    EXPECT_EQ(r.ReadBits(10).value(), 0x023u);  // DEF | POS | HEALTH
+    EXPECT_EQ(r.ReadBits(16).value(), 0u);      // bank selector
+    EXPECT_EQ(r.ReadBits(8).value(), 0u);       // unit type
+    EXPECT_EQ(r.ReadBits(8).value(), 1u);       // team
+}
+
+TEST(BringupPackets, ViewUpdateSnapshotMatchesPythonEntityWireLayout) {
+    std::vector<MvpEntitySnapshot> entities;
+    entities.push_back(MvpEntitySnapshot{1, 0, 1, true, {100.0F, 100.0F, 100.0F}});
+    entities.push_back(MvpEntitySnapshot{2, 0, 2, true, {140.0F, 100.0F, 100.0F}});
+
+    const auto bytes = BuildViewUpdateSnapshot(123, entities, 1.0F, 1.0F);
+    const Frame f = FirstFrame(bytes);
+    ASSERT_EQ(f.opcode, static_cast<std::uint8_t>(Opcode::ViewUpdate));
+    ASSERT_GE(f.body.size(), 8u);
+
+    // Reference suffix from ../Wulf-Forge's Python UpdateArrayPacket serializer:
+    // [has-local-stats..entities]. The first 8 bytes are timestamp+sequence and
+    // are intentionally ignored here.
+    const std::vector<std::uint8_t> expected_suffix = {
+        0x80, 0x01, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x61, 0x18, 0x00, 0x00, 0x00, 0x08,
+        0x0F, 0xDF, 0x9C, 0x1F, 0x9C, 0x1F, 0x9C, 0x00, 0x10, 0x00, 0x00, 0x00, 0x28, 0x46,
+        0x00, 0x00, 0x00, 0x04, 0x05, 0xF7, 0xDD, 0x07, 0xE7, 0x07, 0xE7, 0x00, 0x04};
+    const std::vector<std::uint8_t> actual_suffix(f.body.begin() + 8, f.body.end());
+
+    EXPECT_EQ(actual_suffix, expected_suffix);
+}
+
+TEST(BringupPackets, BehaviorMatchesPythonPacketsTomlDefaults) {
+    const auto bytes = BuildBehavior();
+    EXPECT_EQ(bytes.size(), 3566u);
+    EXPECT_EQ(Fnv1a32(bytes), 0x11c91899u);
+}
+
+TEST(WorldPackets, SpawnResultPacketsMatchPythonReferenceShapes) {
+    const Frame reincarnate = FirstFrame(BuildReincarnateResult(0, ""));
+    EXPECT_EQ(reincarnate.opcode, static_cast<std::uint8_t>(Opcode::Reincarnate));
+    BitReader reincarnate_reader(reincarnate.body.data(), reincarnate.body.size());
+    EXPECT_EQ(reincarnate_reader.ReadByte().value(), 0);
+    EXPECT_EQ(reincarnate_reader.ReadString(64).value(), "");
+
+    const Frame birth = FirstFrame(BuildBirthNotice(7));
+    EXPECT_EQ(birth.opcode, static_cast<std::uint8_t>(Opcode::BirthNotice));
+    BitReader birth_reader(birth.body.data(), birth.body.size());
+    EXPECT_EQ(birth_reader.ReadI32().value(), 7);
+    EXPECT_EQ(birth_reader.ReadI32().value(), 1);
+
+    TankSpawnSpec spec;
+    spec.sequence = 77;
+    spec.net_id = 99;
+    spec.unit_type = 0;
+    spec.team = 1;
+    spec.pos = {400.0F, 500.0F, 90.0F};
+    spec.rot = {0.0F, 0.0F, 0.0F};
+
+    const Frame tank = FirstFrame(BuildTankSpawn(spec));
+    EXPECT_EQ(tank.opcode, static_cast<std::uint8_t>(Opcode::TankSpawn));
+    BitReader tank_reader(tank.body.data(), tank.body.size());
+    EXPECT_EQ(tank_reader.ReadI32().value(), 77);
+    EXPECT_TRUE(tank_reader.ReadBool().value());
+    EXPECT_EQ(tank_reader.ReadBits(5).value(), 0u);
+    EXPECT_EQ(tank_reader.ReadBits(10).value(), 1u);
+    EXPECT_EQ(tank_reader.ReadBits(10).value(), 1u);
+    EXPECT_EQ(tank_reader.ReadI32().value(), 0);
+    EXPECT_EQ(tank_reader.ReadI32().value(), 99);
+    EXPECT_EQ(tank_reader.ReadByte().value(), 1);
+    EXPECT_NEAR(tank_reader.ReadFixed1616().value(), 400.0, 0.001);
+    EXPECT_NEAR(tank_reader.ReadFixed1616().value(), 500.0, 0.001);
+    EXPECT_NEAR(tank_reader.ReadFixed1616().value(), 90.0, 0.001);
+}
+
+// --- Connection state machine ----------------------------------------------
+
+// Drive a connection through the full proven order and assert it reaches Verified.
+TEST(Connection, HappyPathReachesVerified) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+
+    const auto hello = conn.OnAccept();
+    EXPECT_FALSE(hello.empty());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingKeyEcho);
+
+    // Client sends HELLO(version) on TCP — accepted, still awaiting key echo.
+    const auto vframe = MakeFrame(Opcode::Hello, [](wfh::proto::BitWriter& w) {
+        w.WriteByte(0x00);
+        w.WriteI32(kProtocolVersion);
+    });
+    auto step = conn.OnTcpData(vframe.data(), vframe.size());
+    EXPECT_FALSE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::AwaitingKeyEcho);
+
+    // UDP key echo links the endpoint -> AwaitingUsername + IDENTIFIED_UDP out.
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);  // HELLO subtype key-echo
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+
+    // LOGIN username -> AwaitingPassword.
+    const auto uframe =
+        MakeFrame(Opcode::Login, [](wfh::proto::BitWriter& w) { w.WriteString("alice"); });
+    const auto namestep = conn.OnTcpData(uframe.data(), uframe.size());
+    EXPECT_FALSE(namestep.close);
+    EXPECT_EQ(conn.State(), ConnState::AwaitingPassword);
+
+    // LOGIN password -> Verified + bring-up burst emitted.
+    const auto pframe =
+        MakeFrame(Opcode::Login, [](wfh::proto::BitWriter& w) { w.WriteString("secret"); });
+    auto pstep = conn.OnTcpData(pframe.data(), pframe.size());
+    EXPECT_EQ(conn.State(), ConnState::Verified);
+    EXPECT_FALSE(pstep.tcp_out.empty());
+    const std::vector<Frame> bringup = DrainFrames(pstep.tcp_out);
+    const auto has_behavior = std::any_of(bringup.begin(), bringup.end(), [](const Frame& frame) {
+        return frame.opcode == static_cast<std::uint8_t>(Opcode::Behavior);
+    });
+    const auto has_translation =
+        std::any_of(bringup.begin(), bringup.end(), [](const Frame& frame) {
+            return frame.opcode == static_cast<std::uint8_t>(Opcode::Translation);
+        });
+    EXPECT_TRUE(has_behavior);
+    EXPECT_TRUE(has_translation);
+
+    // WANT_UPDATES -> InGame.
+    const auto wframe = MakeFrame(Opcode::WantUpdates, [](wfh::proto::BitWriter&) {});
+    const auto wstep = conn.OnTcpData(wframe.data(), wframe.size());
+    EXPECT_FALSE(wstep.close);
+    EXPECT_EQ(conn.State(), ConnState::InGame);
+
+    // The inbound queue saw user/password/connected/wantupdates commands.
+    const auto cmds = inbound.DrainAll();
+    EXPECT_GE(cmds.size(), 4u);
+}
+
+TEST(Connection, UdpKeyEchoBeforeTcpVersionStillAcceptsVersionNoOp) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+
+    const auto delayed_version = MakeFrame(Opcode::Hello, [](wfh::proto::BitWriter& w) {
+        w.WriteByte(0x00);
+        w.WriteI32(kProtocolVersion);
+    });
+    const auto step = conn.OnTcpData(delayed_version.data(), delayed_version.size());
+
+    EXPECT_FALSE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+}
+
+TEST(Connection, UdpKeyEchoBeforePostLinkHelloSubcmdTwoKeepsAwaitingUsername) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+
+    const auto post_link_hello =
+        MakeFrame(Opcode::Hello, [](wfh::proto::BitWriter& w) { w.WriteByte(0x02); });
+    const auto step = conn.OnTcpData(post_link_hello.data(), post_link_hello.size());
+
+    EXPECT_FALSE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+}
+
+TEST(Connection, PythonStyleLoginFrameWithPasswordCompletesVerifiedWithoutPrompt) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingUsername);
+
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    const auto step = conn.OnTcpData(login.data(), login.size());
+
+    EXPECT_FALSE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::Verified);
+    EXPECT_FALSE(step.tcp_out.empty());
+}
+
+TEST(Connection, BpsRequestAfterLoginGetsApprovedReply) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    auto login_step = conn.OnTcpData(login.data(), login.size());
+    EXPECT_FALSE(login_step.close);
+    ASSERT_EQ(conn.State(), ConnState::Verified);
+
+    wfh::proto::BitWriter bps_body;
+    bps_body.WriteI32(60);
+    const auto bps = wfh::proto::EncodeTcpFrame(0x4E, bps_body.Bytes()).value();
+    const auto bps_step = conn.OnTcpData(bps.data(), bps.size());
+
+    EXPECT_FALSE(bps_step.close);
+    EXPECT_EQ(conn.State(), ConnState::Verified);
+    const Frame reply = FirstFrame(bps_step.tcp_out);
+    EXPECT_EQ(reply.opcode, 0x4E);
+    BitReader r(reply.body.data(), reply.body.size());
+    EXPECT_EQ(r.ReadI32().value(), 60);
+    EXPECT_EQ(r.ReadByte().value(), 1);
+}
+
+TEST(Connection, InGameUdpReincarnateSpawnRequestEnqueuesCommand) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    auto ustep = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                                  echo_body.size());
+    EXPECT_FALSE(ustep.tcp_out.empty());
+
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    auto login_step = conn.OnTcpData(login.data(), login.size());
+    EXPECT_FALSE(login_step.close);
+    ASSERT_EQ(conn.State(), ConnState::Verified);
+
+    const auto want_updates = MakeFrame(Opcode::WantUpdates, [](wfh::proto::BitWriter&) {});
+    const auto want_step = conn.OnTcpData(want_updates.data(), want_updates.size());
+    EXPECT_FALSE(want_step.close);
+    ASSERT_EQ(conn.State(), ConnState::InGame);
+    (void)inbound.DrainAll();
+
+    const auto spawn_body = MakeSpawnRequestBody(0x1234, 5, 99);
+    const auto spawn_step = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Reincarnate),
+                                             spawn_body.data(), spawn_body.size());
+
+    EXPECT_FALSE(spawn_step.close);
+    ExpectUdpAck(spawn_step.udp_out.data(), spawn_step.udp_out.size(), 0x1234,
+                 static_cast<std::uint8_t>(Opcode::Reincarnate));
+    const auto cmds = inbound.DrainAll();
+    ASSERT_EQ(cmds.size(), 1u);
+    EXPECT_EQ(cmds.at(0).kind, ClientCommandKind::Reincarnate);
+    EXPECT_EQ(cmds.at(0).session_id, 1u);
+    EXPECT_EQ(cmds.at(0).unit_id, 5);
+    EXPECT_EQ(cmds.at(0).pad_id, 99);
+}
+
+TEST(Connection, EarlyGenericPacketBeforeKeyEchoIsNoOp) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    const auto generic = MakeFrame(
+        Opcode::Generic, [](wfh::proto::BitWriter& w) { w.WriteString("want_voice_data"); });
+    const auto step = conn.OnTcpData(generic.data(), generic.size());
+
+    EXPECT_FALSE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::AwaitingKeyEcho);
+}
+
+TEST(MvpOnlineBridge, LoadsMapStateAndSynthesizesRepairPadsBeforeSpawn) {
+    const auto root = TempMapRoot();
+    const auto map_dir = root / "unit_map";
+    std::filesystem::create_directories(map_dir);
+    WriteTextFile(map_dir / "land", "2x2\n"
+                                    "1000x800\n"
+                                    "0 10\n"
+                                    "0 20\n"
+                                    "0 30\n"
+                                    "0 40\n");
+    WriteTextFile(map_dir / "state", "g 1 100 200 300 0 0 0 0\n");
+
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "unit_map";
+    bootstrap.map_root = root.string();
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    ClientCommand connected;
+    connected.kind = ClientCommandKind::ClientConnected;
+    connected.session_id = 1;
+    connected.text = "alice";
+    inbound.Push(connected);
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+
+    bridge.Tick(123);
+    const auto messages = outbound.DrainAll();
+
+    const auto snapshot = FirstViewUpdateForSession(messages, 1);
+    ASSERT_TRUE(snapshot.has_value());
+    const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
+
+    EXPECT_EQ(CountEntitiesMatching(entities, 30, 1, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 1, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 2, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 0, 1, true), 0);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST(MvpOnlineBridge, DefaultBootstrapLoadsBpassFromGameWorkingDirectory) {
+    const auto root = TempMapRoot();
+    const auto map_dir = root / "data" / "maps" / "bpass";
+    std::filesystem::create_directories(map_dir);
+    WriteTextFile(map_dir / "land", "2x2\n"
+                                    "1000x800\n"
+                                    "0 10\n"
+                                    "0 20\n"
+                                    "0 30\n"
+                                    "0 40\n");
+    WriteTextFile(map_dir / "state", "g 1 100 200 300 0 0 0 0\n");
+
+    std::optional<Frame> snapshot;
+    {
+        const ScopedCurrentPath scoped_cwd(root);
+        IncomingCmdQueue inbound;
+        OutboundStateQueue outbound;
+        MvpOnlineBridge bridge(inbound, outbound);
+
+        ClientCommand connected;
+        connected.kind = ClientCommandKind::ClientConnected;
+        connected.session_id = 1;
+        connected.text = "alice";
+        inbound.Push(connected);
+        inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+
+        bridge.Tick(123);
+        snapshot = FirstViewUpdateForSession(outbound.DrainAll(), 1);
+    }
+
+    ASSERT_TRUE(snapshot.has_value());
+    const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
+    EXPECT_EQ(CountEntitiesMatching(entities, 30, 1, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 1, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 2, false), 1);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST(MvpOnlineBridge, ReincarnateSpawnUsesRepairPadAndBroadcastsSpawnState) {
+    const auto root = TempMapRoot();
+    const auto map_dir = root / "unit_map";
+    std::filesystem::create_directories(map_dir);
+    WriteTextFile(map_dir / "land", "2x2\n"
+                                    "1000x800\n"
+                                    "0 10\n"
+                                    "0 20\n"
+                                    "0 30\n"
+                                    "0 40\n");
+
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "unit_map";
+    bootstrap.map_root = root.string();
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    ClientCommand connected;
+    connected.kind = ClientCommandKind::ClientConnected;
+    connected.session_id = 1;
+    connected.text = "alice";
+    inbound.Push(connected);
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+
+    ClientCommand spawn;
+    spawn.kind = ClientCommandKind::Reincarnate;
+    spawn.session_id = 1;
+    spawn.unit_id = 1;
+    inbound.Push(spawn);
+
+    bridge.Tick(123);
+    const auto messages = outbound.DrainAll();
+
+    bool saw_tank = false;
+    bool saw_reincarnate = false;
+    bool saw_birth = false;
+    for (const OutboundMessage& msg : messages) {
+        const Frame frame = FirstFrame(msg.bytes);
+        saw_tank = saw_tank || frame.opcode == static_cast<std::uint8_t>(Opcode::TankSpawn);
+        saw_reincarnate =
+            saw_reincarnate || frame.opcode == static_cast<std::uint8_t>(Opcode::Reincarnate);
+        saw_birth = saw_birth || frame.opcode == static_cast<std::uint8_t>(Opcode::BirthNotice);
+    }
+    EXPECT_TRUE(saw_tank);
+    EXPECT_TRUE(saw_reincarnate);
+    EXPECT_TRUE(saw_birth);
+
+    const auto snapshot = FirstViewUpdateForSession(messages, 1);
+    ASSERT_TRUE(snapshot.has_value());
+    const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 1, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 27, 2, false), 1);
+    EXPECT_EQ(CountEntitiesMatching(entities, 0, 1, true), 1);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
+    const auto root = TempMapRoot();
+    const auto map_dir = root / "unit_map";
+    std::filesystem::create_directories(map_dir);
+    WriteTextFile(map_dir / "land", "2x2\n"
+                                    "1000x800\n"
+                                    "0 10\n"
+                                    "0 20\n"
+                                    "0 30\n"
+                                    "0 40\n");
+
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "unit_map";
+    bootstrap.map_root = root.string();
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 1, 0, 0.0F, 0, 0, 0, "alice"});
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 2, 0, 0.0F, 0, 0, 0, "bob"});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 2});
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 0, 1, 0, {}});
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 2, 0, 0.0F, 0, 2, 0, {}});
+
+    bridge.Tick(123);
+    const auto messages = outbound.DrainAll();
+
+    std::array<bool, 3> saw_snapshot{};
+    for (const OutboundMessage& msg : messages) {
+        ASSERT_TRUE(msg.reliable);
+        const Frame frame = FirstFrame(msg.bytes);
+        if (frame.opcode != static_cast<std::uint8_t>(Opcode::ViewUpdate)) {
+            continue;
+        }
+        EXPECT_EQ(CountEntitiesInViewUpdate(frame), 4);
+        if (msg.session_id < saw_snapshot.size()) {
+            saw_snapshot.at(static_cast<std::size_t>(msg.session_id)) = true;
+        }
+    }
+
+    EXPECT_TRUE(saw_snapshot.at(1));
+    EXPECT_TRUE(saw_snapshot.at(2));
+    std::filesystem::remove_all(root);
+}
+
+TEST(Connection, VersionMismatchDrops) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+    const auto bad = MakeFrame(Opcode::Hello, [](wfh::proto::BitWriter& w) {
+        w.WriteByte(0x00);
+        w.WriteI32(0x1234);  // wrong version
+    });
+    auto step = conn.OnTcpData(bad.data(), bad.size());
+    EXPECT_TRUE(step.close);
+    EXPECT_EQ(conn.State(), ConnState::Closed);
+}
+
+TEST(Connection, OutOfOrderLoginBeforeKeyEchoDrops) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+    // LOGIN before the UDP link is established is out of order -> drop.
+    const auto login =
+        MakeFrame(Opcode::Login, [](wfh::proto::BitWriter& w) { w.WriteString("alice"); });
+    auto step = conn.OnTcpData(login.data(), login.size());
+    EXPECT_TRUE(step.close);
+}
+
+TEST(Connection, UnknownOpcodeDrops) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+    // 0x77 is not a known opcode.
+    const auto junk = wfh::proto::EncodeTcpFrame(0x77, {0x01, 0x02}).value();
+    auto step = conn.OnTcpData(junk.data(), junk.size());
+    EXPECT_TRUE(step.close);
+}
+
+TEST(Connection, GarbageBytesDoNotCrashAndDrop) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+    // A length prefix below the 3-byte minimum is rejected by the accumulator.
+    const std::vector<std::uint8_t> garbage = {0x00, 0x01, 0xFF, 0xFF};
+    auto step = conn.OnTcpData(garbage.data(), garbage.size());
+    EXPECT_TRUE(step.close);
+}
+
+TEST(Connection, WrongKeyEchoDoesNotLink) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("WrongKey");
+    const auto body = echo.Bytes();
+    auto step =
+        conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), body.data(), body.size());
+    EXPECT_TRUE(step.tcp_out.empty());
+    EXPECT_FALSE(conn.UdpLinked());
+    EXPECT_EQ(conn.State(), ConnState::AwaitingKeyEcho);
+}
+
+// --- Queue boundary --------------------------------------------------------
+
+TEST(ConcurrentQueue, ProducerConsumerThreadSafe) {
+    IncomingCmdQueue q;
+    constexpr int kN = 1000;
+    std::thread producer([&] {
+        for (int i = 0; i < kN; ++i) {
+            q.Push(ClientCommand{ClientCommandKind::ActionInput, static_cast<std::uint64_t>(i)});
+        }
+    });
+    int seen = 0;
+    while (seen < kN) {
+        auto items = q.DrainAll();
+        seen += static_cast<int>(items.size());
+        if (items.empty()) {
+            std::this_thread::yield();
+        }
+    }
+    producer.join();
+    EXPECT_EQ(seen, kN);
+    EXPECT_TRUE(q.Empty());
+}
+
+// --- Runtime owner ---------------------------------------------------------
+
+TEST(ServerRuntime, StartsAndStopsAcceptorOnEphemeralPort) {
+    ServerConfig cfg;
+    cfg.bind_port = 0;
+
+    ServerRuntime runtime;
+    ASSERT_TRUE(runtime.Start(cfg));
+    EXPECT_TRUE(runtime.Running());
+    EXPECT_NE(runtime.BoundPort(), 0);
+
+    runtime.Stop();
+    EXPECT_FALSE(runtime.Running());
+}
+
+// --- Acceptor loopback smoke ----------------------------------------------
+
+// Bind on an ephemeral port, connect a raw TCP client, and assert the server sends
+// the initial HELLO burst (UDP_CONFIG/VERSION/SESSION_KEY) on accept.
+TEST(Acceptor, LoopbackAcceptSendsHelloBurst) {
+    WSADATA wsa{};
+    ASSERT_EQ(WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+
+    ServerConfig cfg;
+    cfg.bind_port = 0;  // ephemeral
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    Acceptor acceptor(cfg, inbound, outbound);
+    ASSERT_TRUE(acceptor.Start());
+    const std::uint16_t port = acceptor.BoundPort();
+    ASSERT_NE(port, 0);
+
+    SOCKET cli = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(cli, INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(connect(cli, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Read the HELLO burst the server sends on accept (with a short timeout).
+    DWORD tmo = 2000;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    std::array<std::uint8_t, 512> buf{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const int n = recv(cli, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    ASSERT_GT(n, 0);
+
+    // First frame must be HELLO (0x13). Decode and confirm.
+    TcpFrameAccumulator acc;
+    ASSERT_TRUE(acc.Feed(buf.data(), static_cast<std::size_t>(n)));
+    auto frame = acc.Next();
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame->opcode, static_cast<std::uint8_t>(Opcode::Hello));
+
+    closesocket(cli);
+    acceptor.Stop();
+    WSACleanup();
+}
+
+TEST(Acceptor, TcpDisconnectEnqueuesDisconnectedCommand) {
+    WSADATA wsa{};
+    ASSERT_EQ(WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+
+    ServerConfig cfg;
+    cfg.bind_port = 0;  // ephemeral
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    Acceptor acceptor(cfg, inbound, outbound);
+    ASSERT_TRUE(acceptor.Start());
+
+    SOCKET cli = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(cli, INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(acceptor.BoundPort());
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(connect(cli, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    closesocket(cli);
+
+    bool saw_disconnect = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!saw_disconnect && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& cmd : inbound.DrainAll()) {
+            saw_disconnect = saw_disconnect || cmd.kind == ClientCommandKind::Disconnected;
+        }
+        if (!saw_disconnect) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    acceptor.Stop();
+    WSACleanup();
+    EXPECT_TRUE(saw_disconnect);
+}
+
+TEST(Acceptor, RawUdpHelloKeyEchoLinksSession) {
+    WSADATA wsa{};
+    ASSERT_EQ(WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+
+    ServerConfig cfg;
+    cfg.bind_port = 0;  // ephemeral
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    Acceptor acceptor(cfg, inbound, outbound);
+    ASSERT_TRUE(acceptor.Start());
+    const std::uint16_t port = acceptor.BoundPort();
+    ASSERT_NE(port, 0);
+
+    SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(tcp, INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(connect(tcp, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    DWORD tmo = 2000;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    setsockopt(tcp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    std::array<std::uint8_t, 512> buf{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const int hello_count =
+        recv(tcp, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    ASSERT_GT(hello_count, 0);
+    const std::string key = SessionKeyFromHelloBurst({buf.begin(), buf.begin() + hello_count});
+    ASSERT_FALSE(key.empty());
+
+    SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_NE(udp, INVALID_SOCKET);
+    const auto echo = MakeRawUdpHelloKeyEcho(key);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(sendto(udp, reinterpret_cast<const char*>(echo.data()), static_cast<int>(echo.size()),
+                     0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+              static_cast<int>(echo.size()));
+
+    const int identified_count =
+        recv(tcp, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    ASSERT_GT(identified_count, 0);
+    const Frame identified = FirstFrame({buf.begin(), buf.begin() + identified_count});
+    EXPECT_EQ(identified.opcode, static_cast<std::uint8_t>(Opcode::IdentifiedUdp));
+
+    closesocket(udp);
+    closesocket(tcp);
+    acceptor.Stop();
+    WSACleanup();
+}
+
+TEST(Acceptor, LinkedRawUdpReincarnateEnqueuesCommand) {
+    WSADATA wsa{};
+    ASSERT_EQ(WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+
+    ServerConfig cfg;
+    cfg.bind_port = 0;  // ephemeral
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    Acceptor acceptor(cfg, inbound, outbound);
+    ASSERT_TRUE(acceptor.Start());
+    const std::uint16_t port = acceptor.BoundPort();
+    ASSERT_NE(port, 0);
+
+    SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(tcp, INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(connect(tcp, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    DWORD tmo = 2000;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    setsockopt(tcp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    std::array<std::uint8_t, 4096> buf{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const int hello_count =
+        recv(tcp, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    ASSERT_GT(hello_count, 0);
+    const std::string key = SessionKeyFromHelloBurst({buf.begin(), buf.begin() + hello_count});
+    ASSERT_FALSE(key.empty());
+
+    SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_NE(udp, INVALID_SOCKET);
+    const auto echo = MakeRawUdpHelloKeyEcho(key);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(sendto(udp, reinterpret_cast<const char*>(echo.data()), static_cast<int>(echo.size()),
+                     0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+              static_cast<int>(echo.size()));
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const int identified_count =
+        recv(tcp, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+    ASSERT_GT(identified_count, 0);
+
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(
+        send(tcp, reinterpret_cast<const char*>(login.data()), static_cast<int>(login.size()), 0),
+        static_cast<int>(login.size()));
+
+    auto wait_for_command = [&](ClientCommandKind kind) -> std::optional<ClientCommand> {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& cmd : inbound.DrainAll()) {
+                if (cmd.kind == kind) {
+                    return cmd;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return std::nullopt;
+    };
+    ASSERT_TRUE(wait_for_command(ClientCommandKind::ClientConnected).has_value());
+
+    const auto want_updates = MakeFrame(Opcode::WantUpdates, [](wfh::proto::BitWriter&) {});
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(send(tcp, reinterpret_cast<const char*>(want_updates.data()),
+                   static_cast<int>(want_updates.size()), 0),
+              static_cast<int>(want_updates.size()));
+    ASSERT_TRUE(wait_for_command(ClientCommandKind::WantUpdates).has_value());
+
+    std::vector<std::uint8_t> spawn{static_cast<std::uint8_t>(Opcode::Reincarnate)};
+    const auto body = MakeSpawnRequestBody(0x1234, 5, 99);
+    spawn.insert(spawn.end(), body.begin(), body.end());
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ASSERT_EQ(sendto(udp, reinterpret_cast<const char*>(spawn.data()),
+                     static_cast<int>(spawn.size()), 0, reinterpret_cast<sockaddr*>(&addr),
+                     sizeof(addr)),
+              static_cast<int>(spawn.size()));
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    sockaddr_in ack_from{};
+    int ack_from_len = sizeof(ack_from);
+    std::array<std::uint8_t, 64> ack_buf{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const int ack_count =
+        recvfrom(udp, reinterpret_cast<char*>(ack_buf.data()), static_cast<int>(ack_buf.size()), 0,
+                 reinterpret_cast<sockaddr*>(&ack_from), &ack_from_len);
+    ASSERT_GT(ack_count, 0);
+    ExpectUdpAck(ack_buf.data(), static_cast<std::size_t>(ack_count), 0x1234,
+                 static_cast<std::uint8_t>(Opcode::Reincarnate));
+
+    const auto cmd = wait_for_command(ClientCommandKind::Reincarnate);
+    ASSERT_TRUE(cmd.has_value());
+    EXPECT_EQ(cmd->unit_id, 5);
+    EXPECT_EQ(cmd->pad_id, 99);
+
+    closesocket(udp);
+    closesocket(tcp);
+    acceptor.Stop();
+    WSACleanup();
+}
+
+}  // namespace

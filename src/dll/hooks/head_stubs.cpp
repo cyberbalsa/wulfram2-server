@@ -3,10 +3,13 @@
 #include "engine_hooks.hpp"
 
 #include "wfh/log.hpp"
+#include "wfh/server/tick_guard.hpp"
+#include "wfh/server/world_packets.hpp"
 
 #include "addresses.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +70,12 @@ template <typename Func> auto AsVoidPtr(Func func) -> void* {
     return reinterpret_cast<void*>(func);
 }
 
+auto HwndValue(HWND hwnd) -> unsigned {
+    // Handles are pointer-sized Win32 values; this is logging-only.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(hwnd));
+}
+
 // ---------------------------------------------------------------------------
 // Approach B step 1: force the "Software Windowed" (GDI) renderer.
 //
@@ -82,6 +91,8 @@ template <typename Func> auto AsVoidPtr(Func func) -> void* {
 constexpr std::uint32_t kForceSoftwareWindowedFlagVA = 0x00679169;
 
 void ForceSoftwareRenderer() {
+    WFH_TRACE("head", "forcing Software Windowed flag at VA=0x%08X",
+              static_cast<unsigned>(kForceSoftwareWindowedFlagVA));
     // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
     *static_cast<volatile std::uint8_t*>(TargetAt(kForceSoftwareWindowedFlagVA)) = 1;
     WFH_INFO("head", "Approach B: forced Software Windowed (DAT_00679169=1)");
@@ -135,6 +146,11 @@ auto WINAPI Hook_CreateWindowExA(
     // not appear on the taskbar or in the normal Z-order. The DC stays valid.
     const DWORD hidden_style = dwStyle & ~static_cast<DWORD>(WS_VISIBLE);
     const DWORD tool_ex_style = dwExStyle | static_cast<DWORD>(WS_EX_TOOLWINDOW);
+    WFH_TRACE("head", "CreateWindowExA class=%s title=%s style=0x%08lX hidden=0x%08lX ex=0x%08lX",
+              lpClassName != nullptr ? lpClassName : "<null>",
+              lpWindowName != nullptr ? lpWindowName : "<null>",
+              static_cast<unsigned long>(dwStyle), static_cast<unsigned long>(hidden_style),
+              static_cast<unsigned long>(tool_ex_style));
 
     if (!g_window_hidden_logged) {
         WFH_INFO("head", "Approach B: hiding main window (cleared WS_VISIBLE, +WS_EX_TOOLWINDOW)");
@@ -165,6 +181,8 @@ auto WINAPI Hook_ShowWindow(HWND hWnd, int nCmdShow) -> BOOL {
     if (hWnd != nullptr && hWnd == g_main_hwnd) {
         effective_cmd = SW_HIDE;
     }
+    WFH_TRACE("head", "ShowWindow hwnd=0x%08X cmd=%d effective=%d", HwndValue(hWnd), nCmdShow,
+              effective_cmd);
     using ShowWindow_t = BOOL(WINAPI*)(HWND, int);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     auto* const orig = reinterpret_cast<ShowWindow_t>(g_show_window_orig);
@@ -175,6 +193,7 @@ auto WINAPI Hook_ShowWindow(HWND hWnd, int nCmdShow) -> BOOL {
 // and returns false on any failure. Kept as a helper so InstallWindowHider stays
 // under the cognitive-complexity gate.
 auto HookUser32Export(HMODULE user32, const char* name, void* detour, void** original) -> bool {
+    WFH_DEBUG("head", "installing user32 hook %s", name);
     // GetProcAddress returns FARPROC; reinterpret to the typed pointer we hook.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     void* const target = reinterpret_cast<void*>(GetProcAddress(user32, name));
@@ -190,6 +209,7 @@ auto HookUser32Export(HMODULE user32, const char* name, void* detour, void** ori
 }
 
 auto InstallWindowHider() -> bool {
+    WFH_DEBUG("head", "installing window hider hooks");
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32 == nullptr) {
         WFH_FATAL("head", "Approach B: GetModuleHandleW(user32.dll) failed (%lu)", GetLastError());
@@ -353,10 +373,34 @@ constexpr std::uint32_t kClientRenderFrameVA = 0x004281a0;
 // Util_SleepMillis(100) cadence (~10 Hz). M5 can lower this for a faster server tick.
 constexpr DWORD kServerTickPaceMs = 100;
 
-auto WINAPI Stub_Client_RenderFrame() -> void {
+// Exit code raised when the guarded server tick catches an SEH fault ('WT').
+constexpr UINT kTickFaultExitCode = 0x5754;
+
+// Monotonic tick breadcrumb for our guarded tick seam. This is not game state and
+// does not cross to clients; it is crash-diagnostic metadata only.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<std::uint64_t> g_guarded_tick{0};
+
+void __cdecl PaceServerTick(void* /*user*/) {
     // No rendering on a headless server. Pace the tick so the inline loop does not
     // busy-spin when the window proc has set the render gate.
+    WFH_TRACE("tick", "Client_RenderFrame suppressed; pacing %lums",
+              static_cast<unsigned long>(kServerTickPaceMs));
+    server::ProcessMvpOnlineTick(
+        static_cast<std::uint32_t>(g_guarded_tick.load(std::memory_order_relaxed)));
     Sleep(kServerTickPaceMs);
+}
+
+auto WINAPI Stub_Client_RenderFrame() -> void {
+    server::TickBreadcrumb breadcrumb;
+    breadcrumb.tick = g_guarded_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+    breadcrumb.phase = "Client_RenderFrame";
+    const server::TickGuardResult result =
+        server::RunProtectedTick(breadcrumb, &PaceServerTick, nullptr);
+    if (!result.ok) {
+        Log::Shutdown();
+        ExitProcess(kTickFaultExitCode);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +409,7 @@ auto WINAPI Stub_Client_RenderFrame() -> void {
 // Install the registry-gate + browser bypass detours. The detours never call
 // through, so each trampoline is discarded.
 auto InstallRegistryGateBypass() -> bool {
+    WFH_DEBUG("head", "installing registry/browser bypass hooks");
     struct Bypass {
         const char* name;
         void* target;
@@ -394,6 +439,7 @@ auto InstallRegistryGateBypass() -> bool {
 // this one CALLS THROUGH for non-boot callers, so it passes the real trampoline
 // slot (g_app_exit_gracefully_orig) to InstallDetour. Returns true on success.
 auto InstallAppExitGracefullyGuard() -> bool {
+    WFH_DEBUG("head", "installing App_ExitGracefully guard");
     if (!InstallDetour(TargetAt(addr::App_ExitGracefully), AsVoidPtr(&Stub_App_ExitGracefully),
                        &g_app_exit_gracefully_orig)) {
         WFH_FATAL("head", "M3.7: failed to install App_ExitGracefully boot-exit guard");
@@ -408,6 +454,7 @@ auto InstallAppExitGracefullyGuard() -> bool {
 // never calls through (no rendering), so the trampoline is discarded. Returns true
 // on success.
 auto InstallServerTick() -> bool {
+    WFH_DEBUG("head", "installing Client_RenderFrame server tick hook");
     void* original = nullptr;
     if (!InstallDetour(TargetAt(kClientRenderFrameVA), AsVoidPtr(&Stub_Client_RenderFrame),
                        &original)) {
@@ -427,6 +474,7 @@ auto InstallServerTick() -> bool {
 // something set the connect/exit gate. The detour never calls through. Returns true
 // on success.
 auto InstallLoopObservationDetour() -> bool {
+    WFH_DEBUG("head", "installing Client_RunMainLoop observation hook");
     void* original = nullptr;
     if (!InstallDetour(TargetAt(addr::Client_RunMainLoop),
                        AsVoidPtr(&Stub_Client_RunMainLoop_Observe), &original)) {
@@ -440,6 +488,7 @@ auto InstallLoopObservationDetour() -> bool {
 }  // namespace
 
 auto InstallHeadStubs() -> bool {
+    WFH_DEBUG("head", "InstallHeadStubs begin");
     // Approach B step 1: force the GDI "Software Windowed" renderer before the game
     // resumes, so Render_SwitchActiveDriver picks it and never hits the "Hokey
     // Display Card" error box.
@@ -473,7 +522,11 @@ auto InstallHeadStubs() -> bool {
 
     // Tripwire on the terminal Client_RunMainLoop path (should not fire under M4.2).
     // Live before the loader resumes the game thread.
-    return InstallLoopObservationDetour();
+    const bool loop_hooked = InstallLoopObservationDetour();
+    if (loop_hooked) {
+        WFH_DEBUG("head", "InstallHeadStubs complete");
+    }
+    return loop_hooked;
 }
 
 }  // namespace wfh

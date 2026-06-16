@@ -104,10 +104,105 @@ socket server speaking the proven `Wulf-Forge` framing (NOT the engine's client-
 **HARD CONSTRAINT (user):** the ENGINE owns/tracks the whole object world — spawn all entities into its own
 pools via `World_InitState`/`SpatialRoot_InitFromMap`/`CollisionSystem_InitGlobals`/`Game_EnterWorldAsObject`/
 `Obj_InitFromSpawn`, so its NATIVE collision/spatial-index/raycast/hit-detection work on real objects. No
-parallel object model or reimplemented collision in C++. See `memory/m5-server-topology-all-in-dll.md`.
+parallel object model or reimplemented collision in C++. The engine remains the source of truth for the
+entire game state sent to clients; the C++ socket layer may hold only session state, validated commands,
+and by-value outbound snapshots from the engine tick. See `memory/m5-server-topology-all-in-dll.md`.
 M5.0 RE complete (`49ad05b`): full handshake (HELLO ver `0x4E89`), entity contract (euler orient `+0x30`,
 health `+0xD0`…), and the 5 "gamestate-bad" traps the headless design avoids. **Driving M5 in tight,
 controller-reviewed steps** (the prior autonomous agent overran repeatedly; now done).
+
+### M5 implementation progress (2026-06-16)
+- [x] **M5.1a** — hardened wire-protocol core already landed (`4f5bdea`): MSB-first bit codec,
+      TCP/UDP framing, fixed16.16/string helpers, opcode/field validators, adversarial tests.
+- [~] **M5.1b host-tested socket front end** — added `wfh_server_net` target + WinSock2
+      select-based TCP/UDP acceptor, config parser, bring-up packet builders, per-connection
+      HELLO/LOGIN/WANT_UPDATES state machine, thread-safe inbound/outbound queues, and a DLL-owned
+      `ServerRuntime` that starts/stops the acceptor from `headless.toml`. TDD additions:
+      loopback TCP HELLO burst, disconnect reaping -> `Disconnected`, raw UDP HELLO key-echo
+      compatibility, and runtime start/stop on an ephemeral port. `InitThread` now starts the
+      socket runtime after binary self-check + hook install and before the loader ready signal;
+      bind/start failure is fatal before the suspended game is resumed. Added TRACE/DEBUG probes
+      across DLL init, hook install/call paths, socket runtime/acceptor, and connection state
+      transitions; default DLL config now enables TRACE, and CMake copies `config/headless.toml`
+      into `build/config` so injected runs use the repo default. Verified `.\build.ps1` =
+      61/61 CTest PASS and `.\lint.ps1` = PASS.
+      **Injected listener smoke passed:** `build\loader.exe .\w2\wulfram2.exe -windowed`
+      logged `level=0`, `server runtime listening on port 2627`, TRACE tick/hook/net lines,
+      and accepted a TCP loopback session; launched process was cleaned up. **Real rendering
+      client smoke still pending**; current bar is injected DLL listener behavior.
+- [x] **M5.1c MVP online visibility bridge** — clients can now connect, complete the proven
+      HELLO/UDP/LOGIN/WANT_UPDATES flow, and receive visible tank snapshots for each connected
+      session. Ported the old `../Wulf-Forge` BEHAVIOR/TRANSLATION bootstrap shape into
+      host-tested C++ packet builders, added a `VIEW_UPDATE` full-snapshot encoder, and added a
+      tick-owned `MvpOnlineBridge` that drains validated session commands and pushes reliable
+      per-session snapshots back through the acceptor. TDD coverage: translation table shape,
+      two-tank `VIEW_UPDATE`, post-login BEHAVIOR+TRANSLATION bring-up, bridge fanout to both
+      sessions, and a regression for the real TCP/UDP ordering race where UDP key echo can arrive
+      before the delayed TCP HELLO(version). Verified `.\build.ps1` = 68/68 CTest PASS and
+      `.\lint.ps1` = PASS.
+      **Injected MVP smoke passed:** `build\loader.exe .\w2\wulfram2.exe -windowed` on the default
+      config (`trace`, port 2627), two raw loopback clients logged in, sent `WANT_UPDATES`, and both
+      received `VIEW_UPDATE` entity counts `[2, 2]`; launched process was cleaned up. **Authority
+      caveat:** this is a temporary tick-owned projection so clients can see tanks online. Ghidra
+      showed `Obj_Create @ 0x00419a70` and `Obj_InitFromSpawn @ 0x00419880` use custom EBX/EAX
+      register handoff patterns, so the next engine-source-of-truth step needs a small verified
+      assembly/ABI wrapper before snapshots are read from real engine objects.
+- [x] **M5.1d map/spawn/physics packet parity** — continued the MVP toward real rendering-client
+      compatibility using the old `../Wulf-Forge` server as protocol reference. TDD additions now
+      cover: loading map `state` entities before player spawn, synthesizing team repair pads when
+      map state lacks them, parsing in-game UDP reincarnate/spawn requests, emitting Python-shaped
+      `TankSpawn`/`Reincarnate`/`BirthNotice` packets, and matching the Python `packets.toml`
+      BEHAVIOR full-frame length/hash (`3566`, FNV-1a32 `0x11c91899`). The default map is now
+      `bpass` in both `ServerConfig` and `config/headless.toml`, matching the Python default; the
+      sent physics values now match `packets.toml` (`ground_friction=0.8`, `turn_rate=0.05`,
+      `suspension_dampening=1.3`, `gravity_pct=1.0`). Verified `.\build.ps1` = 79/79 CTest PASS
+      and `.\lint.ps1` = PASS. **Live rendering-client smoke status:** the previous attempt was
+      stopped after client instability/launch confusion, all `wulfram2` processes were killed, and
+      the original `w2\_override_args` was restored; rerun pending after this `bpass` + BEHAVIOR
+      parity fix.
+      **Follow-up before handoff:** live smoke then proved the server/client flow could reach
+      login/WANT_UPDATES and send a snapshot, but also exposed that injected map loading used the
+      wrong relative root (`w2\data\maps` from an already-`w2` CWD), so `bpass/state` was missed and
+      fallback pads were used. Added a failing default-bootstrap regression, changed the default map
+      root to `data\maps`, and logged resolved state paths. Also matched the Python server's UDP
+      reincarnate ACK (`0x02`, len `9`, subcmd `1`, acked opcode/sequence), with both connection and
+      acceptor socket tests. Latest verification before handoff: `.\build.ps1` = 80/80 CTest PASS.
+      The final `.\lint.ps1` rerun was interrupted by the user after lint-driven structural fixes,
+      so lint still needs a fresh rerun next session before claiming clean.
+- [~] **M5.3 guarded tick seam** — added host-tested `wfh_server_tick` SEH boundary:
+      `RunProtectedTick` records tick/phase breadcrumbs, catches SEH access violations, reports
+      code/address, and optionally writes a minidump through DbgHelp. TDD path started red on the
+      missing guard API, then added tests for success, SEH capture, and dump writing. The live
+      `Client_RenderFrame` detour now runs its headless pacing body through this guard and exits
+      with a distinct `WT` code on guarded faults; TRACE logging is enabled around begin/end and
+      render suppression by default. Verified `.\build.ps1` = 64/64 CTest PASS, `.\lint.ps1` =
+      PASS, and injected smoke observed both `server runtime listening` and
+      `protected tick begin phase=Client_RenderFrame` under `build\logs\headless.log`.
+- **Physics timing check (Ghidra, 2026-06-16):** physics is wallclock elapsed-ms based, not
+      render-FPS/present bound. `Interp_StepSimulationSubsteps @ 0x00469e00` computes elapsed
+      time from the engine timer delta (with first-frame default/cap and up to five substeps) and
+      calls `EntityPhysics_RunWorldTick @ 0x004f8550(world, elapsed_ms)`, which divides elapsed ms
+      by 1000.0 before integration/collision. `Client_Main @ 0x004186d0` updates the wallclock
+      delta before sim/interp work and reaches `Client_RenderFrame @ 0x004281a0` only after that.
+      Conclusion: we do **not** need to run rendering just to keep physics advancing. Our current
+      render hook is a post-sim pacing seam; changing its `Sleep(100)` changes the wallclock loop
+      cadence and therefore the elapsed time the next engine tick sees. Caveat: the current SEH
+      guard catches only the render/pacing seam; guarding engine sim faults directly would require
+      a deeper hook around `Interp_StepSimulationSubsteps` or its call site.
+- **Reference checked:** `../Wulf-Forge` Python server is useful as a *protocol/packet-order*
+      reference, not as a game-state model. Confirmed `do_login_and_bootstrap` order, LOGIN status
+      flow, BEHAVIOR/TRANSLATION placement, raw UDP key echo (`opcode+body`) and optional UDP
+      length envelope. The C++ acceptor now accepts the Python-observed raw UDP key echo while
+      keeping strict seq-framed UDP support. Do NOT port Python `EntityManager`/`TankSim` authority;
+      use engine world objects and engine-produced snapshots instead.
+- **Tooling/process constraints:** use Ghidra for engine function-call, ABI, and hook-site lookups
+      when moving back into engine integration; prefer structural fixes over lint suppressions
+      (only suppress macro/SDK necessities); keep network threads away from engine memory.
+- **Next:** official rendering-client smoke against the injected DLL listener, then continue the
+      accepted resequence: finish the engine spawn/read wrapper for M5.4-min map/world populate ->
+      M5.2-min per-entity control injection -> any deeper sim-guard decision for M5.3. The engine
+      must become the source of truth for outbound snapshots; BEHAVIOR/TRANSLATION should
+      ultimately come from engine/captured tables, not hard-coded Python defaults.
 
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.

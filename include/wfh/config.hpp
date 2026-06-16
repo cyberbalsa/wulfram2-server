@@ -25,7 +25,7 @@ inline auto TrimView(std::string_view text) -> std::string_view {
 // when its key (text left of '=') trims to exactly "level" — so keys like noise_level,
 // comments, or values mentioning a level word never mis-fire. The level token is taken
 // from the quoted value (between the first pair of quotes) or, if unquoted, the trimmed
-// RHS, and compared against exact tokens. Defaults to Debug if absent/unrecognized.
+// RHS, and compared against exact tokens. Defaults to Trace if absent/unrecognized.
 // Case-sensitive lowercase tokens: trace/debug/info/warn/error/fatal.
 inline auto ParseLogLevel(std::string_view contents) -> Level {
     static constexpr std::array<std::pair<std::string_view, Level>, 6> kTokens{{
@@ -60,14 +60,14 @@ inline auto ParseLogLevel(std::string_view contents) -> Level {
                     return level;
                 }
             }
-            return Level::Debug;  // "level" key present but no recognized token
+            return Level::Trace;  // "level" key present but no recognized token
         }
         if (nl == std::string_view::npos) {
             break;
         }
         rest.remove_prefix(nl + 1);
     }
-    return Level::Debug;  // no "level" line found
+    return Level::Trace;  // no "level" line found
 }
 
 }  // namespace wfh

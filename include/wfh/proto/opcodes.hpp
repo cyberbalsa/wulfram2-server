@@ -33,6 +33,8 @@ enum class Opcode : std::uint8_t {
     TranslationAck = 0x33,  // client->server: ack the translation table
     WantUpdates = 0x39,     // client->server: ready for updates
     IdentifiedUdp = 0x4D,   // server->client: UDP endpoint linked to TCP session
+    Bps = 0x4E,             // client->server: bandwidth/rate request; server echoes approval
+    Generic = 0x54,         // client->server: misc/voice toggles; benign for MVP
 };
 
 // True if `opcode` is one of the known protocol opcodes above. Anything else from a

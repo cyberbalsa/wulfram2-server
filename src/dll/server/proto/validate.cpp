@@ -18,13 +18,13 @@ constexpr std::uint8_t kPrintableAsciiMax = 0x7E;           // '~'
 
 auto IsKnownOpcode(std::uint8_t opcode) -> bool {
     // Data-driven whitelist — extend by adding the enumerator here and in opcodes.hpp.
-    constexpr std::array<Opcode, 21> kKnown = {
+    constexpr std::array<Opcode, 23> kKnown = {
         Opcode::HelloThere,    Opcode::UpdateArray, Opcode::ViewUpdate,     Opcode::Hello,
         Opcode::DeleteObject,  Opcode::WorldStats,  Opcode::Player,         Opcode::TankSpawn,
         Opcode::AddToRoster,   Opcode::BirthNotice, Opcode::Login,          Opcode::LoginStatus,
         Opcode::Motd,          Opcode::Behavior,    Opcode::Reincarnate,    Opcode::TeamInfo,
         Opcode::GameClock,     Opcode::Translation, Opcode::TranslationAck, Opcode::WantUpdates,
-        Opcode::IdentifiedUdp,
+        Opcode::IdentifiedUdp, Opcode::Bps,         Opcode::Generic,
     };
     return std::any_of(kKnown.begin(), kKnown.end(), [opcode](Opcode known) -> bool {
         return static_cast<std::uint8_t>(known) == opcode;
