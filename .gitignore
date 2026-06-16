@@ -1,5 +1,8 @@
 /build/
 /logs/
+# Clean Wulfram II client install — proprietary game binaries; never commit.
+# This is the canonical target the loader/generator/smoke-test point at.
+/w2/
 *.dmp
 *.log
 __pycache__/

@@ -24,6 +24,12 @@ Running log of non-obvious findings made while building the headless server. New
 - **Quality gate runs on every push** (pre-push). Batch docs-only commits and let them ride up with the next
   code push so the ~1–2 min gate runs once per batch instead of per markdown edit.
 
+## Paths
+- **Canonical clean client install: `./w2/`** (repo-relative; gitignored, proprietary binaries).
+  The loader, `gen_addresses.py` (`--exe`), `config/headless.toml`, and the Task 9 smoke test should
+  target `./w2/wulfram2.exe` — NOT the old `..\Game\` dirty install. The pinning manifest must be
+  generated from the exact build placed in `./w2/`.
+
 ## Binary facts (wulfram2.exe, from Ghidra W2VULK) — for upcoming tasks
 - Image base `0x00400000`, x86, pre-ASLR → fixed-address function pointers are valid.
 - Loop seam: `App_RunGameAndExit @ 0x004a0b70` → `Client_RunMainLoop @ 0x004a0aa0` (flat while-loop).

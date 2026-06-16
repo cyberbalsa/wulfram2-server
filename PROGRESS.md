@@ -31,7 +31,12 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
       Commits `e8b4341`, `5f99f16`. Docs: `docs/quality-gate.md`. (pre-push uses `pwsh`; hooks pinned LF.)
 - [x] **Task 2** — Loader arg parsing (`ParseLoaderArgs` + `CreateInjectionPlan`, GoogleTest). Commit `92f5a01`.
       Verified green via the live pre-push gate (build + lint + ctest).
-- [ ] **Task 3** — PE manifest model + validator
+- [x] **Task 3** — PE manifest model + validator. Commits `f5fdefd`, `8dc72e8` (Codex-hardened:
+      alignment-safe `memcpy` parse, PE32 magic + optional-header-size checks, `VirtualQuery`
+      readability guard so a wrong manifest fail-stops instead of faulting), `3b92105` (tests).
+      10/10 ctest, lint PASS. **Codex-reviewed.**
+- Note: **reordered Task 5 (generator) before Task 4 (injector)** — injector.cpp includes the
+      generated `binary_manifest.h`, so the generator must run first to keep the gate green.
 - [ ] **Task 4** — Injector + loader main
 - [ ] **Task 5** — `gen_addresses.py` generator
 - [ ] **Task 6** — ABI binding typedefs
