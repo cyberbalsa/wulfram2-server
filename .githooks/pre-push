@@ -25,23 +25,25 @@ cat >/dev/null 2>&1 || true
 ROOT=$(git rev-parse --show-toplevel) || exit 1
 cd "$ROOT" || exit 1
 
-# build.ps1 / lint.ps1 use PowerShell 7+ syntax (e.g. the ?. operator), so
-# prefer pwsh when present; fall back to Windows PowerShell (powershell.exe).
-if command -v pwsh >/dev/null 2>&1; then
-    PS="pwsh"
-else
-    PS="powershell.exe"
+# build.ps1 / lint.ps1 use PowerShell 7+ syntax (e.g. the ?. operator) that
+# Windows PowerShell 5.1 (powershell.exe) cannot parse, so PowerShell 7 (pwsh)
+# is required. Fail loudly rather than silently producing a misleading gate.
+if ! command -v pwsh >/dev/null 2>&1; then
+    echo "PUSH BLOCKED: PowerShell 7 (pwsh) not found on PATH." >&2
+    echo "  build.ps1/lint.ps1 require pwsh; Windows PowerShell 5.1 cannot run them." >&2
+    echo "  Install it with:  winget install Microsoft.PowerShell" >&2
+    exit 1
 fi
 
 echo "==> pre-push quality gate: build + tests (/W4 /WX)"
-"$PS" -NoProfile -ExecutionPolicy Bypass -File ./build.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File ./build.ps1
 if [ $? -ne 0 ]; then
     echo "PUSH BLOCKED: build/tests failed (zero-warning /W4 /WX gate)" >&2
     exit 1
 fi
 
 echo "==> pre-push quality gate: static analysis (clang-tidy + cppcheck)"
-"$PS" -NoProfile -ExecutionPolicy Bypass -File ./lint.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File ./lint.ps1
 if [ $? -ne 0 ]; then
     echo "PUSH BLOCKED: static analysis (clang-tidy/cppcheck) failed" >&2
     exit 1

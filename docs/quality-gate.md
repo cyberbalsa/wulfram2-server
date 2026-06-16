@@ -4,6 +4,10 @@ This repo enforces a strict, zero-warning quality gate through **versioned git
 hooks** stored in `.githooks/` and shared via the repository. The hooks are
 split into a fast pre-commit check and a heavy pre-push gate.
 
+This is a **Windows-only** project (32-bit MSVC toolchain). The gate assumes
+Git-for-Windows (so hooks run under Git Bash `sh`), the LLVM and Cppcheck tools
+listed below, and **PowerShell 7+ (`pwsh`)** — see "Required tools".
+
 ## Activation (required once per clone)
 
 The hooks live in-repo but git does not use them until you point `core.hooksPath`
@@ -28,11 +32,14 @@ assumed to be on `PATH`):
 | clang-tidy    | `C:\Program Files\LLVM\bin\clang-tidy.exe`    | pre-push (via `lint.ps1`) |
 | cppcheck      | `C:\Program Files\Cppcheck\cppcheck.exe`      | pre-push (via `lint.ps1`) |
 | MSVC (x86)    | Visual Studio 2022, driven through `vcvars32` | pre-push (via `build.ps1`) |
+| PowerShell 7  | `pwsh` on `PATH` (`winget install Microsoft.PowerShell`) | pre-push (runs the `.ps1` scripts) |
 
-The pre-push hook drives PowerShell to run `build.ps1` / `lint.ps1`. Those
-scripts use PowerShell 7+ syntax, so the hook prefers `pwsh` (PowerShell 7+) and
-only falls back to `powershell.exe` (Windows PowerShell 5.1) if `pwsh` is not on
-`PATH`. Install PowerShell 7+ for the gate to run as intended.
+The pre-push hook runs `build.ps1` / `lint.ps1` via **`pwsh`**. Those scripts use
+PowerShell 7+ syntax (e.g. the `?.` operator) that Windows PowerShell 5.1
+(`powershell.exe`) cannot parse, so PowerShell 7 is **required**: if `pwsh` is
+not on `PATH` the hook blocks the push with an install hint rather than silently
+running a PowerShell that would misreport the gate. Install it with
+`winget install Microsoft.PowerShell`.
 
 The hooks run under Git Bash (`sh`) because this is Git-for-Windows. The hook
 files are kept LF-terminated (enforced via `.gitattributes`) so the `#!/bin/sh`
@@ -65,12 +72,12 @@ short functions) defines the canonical style.
 Runs on `git push`. It ignores the ref list git feeds on stdin and **always**
 runs the full gate:
 
-1. `<pwsh|powershell.exe> -NoProfile -ExecutionPolicy Bypass -File ./build.ps1`
+1. `pwsh -NoProfile -ExecutionPolicy Bypass -File ./build.ps1`
    - CMake configure + build under **`/W4 /WX`** (any warning fails the build),
      then `ctest`. **Tests are part of the push gate.**
    - On failure: prints `PUSH BLOCKED: build/tests failed (zero-warning /W4 /WX
      gate)` and exits non-zero.
-2. `<pwsh|powershell.exe> -NoProfile -ExecutionPolicy Bypass -File ./lint.ps1`
+2. `pwsh -NoProfile -ExecutionPolicy Bypass -File ./lint.ps1`
    - clang-tidy (`WarningsAsErrors: '*'`) + cppcheck (`--error-exitcode=1`) over
      `src/` + `include/`.
    - On failure: prints `PUSH BLOCKED: static analysis (clang-tidy/cppcheck)
