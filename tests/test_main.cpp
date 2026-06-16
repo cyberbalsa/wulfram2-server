@@ -1,3 +1,4 @@
+#include "wfh/config.hpp"
 #include "wfh/engine_abi.hpp"
 #include "wfh/injector.hpp"
 #include "wfh/log.hpp"
@@ -27,6 +28,16 @@ std::string ReadAll(const std::filesystem::path& p) {
 }
 
 }  // namespace
+
+TEST(Config, ParseLogLevel) {
+    EXPECT_EQ(wfh::ParseLogLevel("[log]\nlevel = \"info\"\n"), wfh::Level::Info);
+    EXPECT_EQ(wfh::ParseLogLevel("level = \"trace\""), wfh::Level::Trace);
+    EXPECT_EQ(wfh::ParseLogLevel("level=\"warn\""), wfh::Level::Warn);
+    EXPECT_EQ(wfh::ParseLogLevel("level = \"error\""), wfh::Level::Error);
+    EXPECT_EQ(wfh::ParseLogLevel("[server]\nbind_port = 2627\n"),
+              wfh::Level::Debug);                                           // no level line
+    EXPECT_EQ(wfh::ParseLogLevel("level = \"bogus\""), wfh::Level::Debug);  // unrecognized
+}
 
 TEST(LogTest, WritesToFileAndRespectsLevel) {
     const auto dir = std::filesystem::temp_directory_path() / "wfh_log_test";
