@@ -1,0 +1,21 @@
+---
+# Style chosen to match the existing hand-formatted code so the initial
+# normalization pass produces a minimal diff. The first seven keys below are the
+# project-mandated baseline (see docs/quality-gate.md); the remaining keys were
+# added so clang-format reproduces the existing conventions (2-space trailing
+# comments, access modifiers at namespace indent, aligned macro table, short
+# case labels) rather than churning them.
+BasedOnStyle: LLVM
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 100
+NamespaceIndentation: None
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+# --- conventions matching the existing tree (minimal-diff tuning) ---
+AccessModifierOffset: -4
+SpacesBeforeTrailingComments: 2
+AllowShortCaseLabelsOnASingleLine: true
+AlignConsecutiveMacros: true
+AlignConsecutiveAssignments: false
+AlignTrailingComments: true

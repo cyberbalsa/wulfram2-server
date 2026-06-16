@@ -35,16 +35,16 @@ public:
 // evaluating arguments. A constexpr variadic template cannot capture the call
 // site's file/line, so the macro form is intentional.
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define WFH_LOG(level, category, ...)                                            \
-    do {                                                                         \
-        if (static_cast<int>(level) >= static_cast<int>(::wfh::Log::MinLevel())) \
-            ::wfh::Log::Write((level), (category), __FILE__, __LINE__, __VA_ARGS__); \
+#define WFH_LOG(level, category, ...)                                                              \
+    do {                                                                                           \
+        if (static_cast<int>(level) >= static_cast<int>(::wfh::Log::MinLevel()))                   \
+            ::wfh::Log::Write((level), (category), __FILE__, __LINE__, __VA_ARGS__);               \
     } while (0)
 
 #define WFH_TRACE(cat, ...) WFH_LOG(::wfh::Level::Trace, cat, __VA_ARGS__)
 #define WFH_DEBUG(cat, ...) WFH_LOG(::wfh::Level::Debug, cat, __VA_ARGS__)
-#define WFH_INFO(cat, ...)  WFH_LOG(::wfh::Level::Info,  cat, __VA_ARGS__)
-#define WFH_WARN(cat, ...)  WFH_LOG(::wfh::Level::Warn,  cat, __VA_ARGS__)
+#define WFH_INFO(cat, ...)  WFH_LOG(::wfh::Level::Info, cat, __VA_ARGS__)
+#define WFH_WARN(cat, ...)  WFH_LOG(::wfh::Level::Warn, cat, __VA_ARGS__)
 #define WFH_ERROR(cat, ...) WFH_LOG(::wfh::Level::Error, cat, __VA_ARGS__)
 #define WFH_FATAL(cat, ...) WFH_LOG(::wfh::Level::Fatal, cat, __VA_ARGS__)
 // NOLINTEND(cppcoreguidelines-macro-usage)

@@ -19,12 +19,12 @@ namespace wfh {
 
 auto LevelTag(Level level) -> const char* {
     switch (level) {
-        case Level::Trace: return "TRACE";
-        case Level::Debug: return "DEBUG";
-        case Level::Info:  return "INFO";
-        case Level::Warn:  return "WARN";
-        case Level::Error: return "ERROR";
-        case Level::Fatal: return "FATAL";
+    case Level::Trace: return "TRACE";
+    case Level::Debug: return "DEBUG";
+    case Level::Info: return "INFO";
+    case Level::Warn: return "WARN";
+    case Level::Error: return "ERROR";
+    case Level::Fatal: return "FATAL";
     }
     return "?????";
 }
@@ -40,7 +40,8 @@ struct State {
     std::ofstream file;
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::string> queue;  // NOTE: queue is unbounded; backpressure/cap deferred to the tick-loop milestone (M4).
+    std::deque<std::string> queue;  // NOTE: queue is unbounded; backpressure/cap deferred to the
+                                    // tick-loop milestone (M4).
     std::thread worker;
     std::atomic<bool> running{false};
     std::atomic<int> min_level{static_cast<int>(Level::Debug)};
@@ -94,8 +95,9 @@ void WorkerMain() {
     while (state.running.load()) {
         {
             std::unique_lock<std::mutex> lock(state.mutex);
-            state.cv.wait_for(lock, kWorkerPollInterval,
-                              [&]() -> bool { return !state.queue.empty() || !state.running.load(); });
+            state.cv.wait_for(lock, kWorkerPollInterval, [&]() -> bool {
+                return !state.queue.empty() || !state.running.load();
+            });
         }
         DrainOnce(state);
     }
@@ -130,9 +132,13 @@ void Log::Shutdown() {
     }
 }
 
-void Log::SetTick(std::uint64_t tick) { S().tick.store(tick); }
+void Log::SetTick(std::uint64_t tick) {
+    S().tick.store(tick);
+}
 
-auto Log::MinLevel() -> Level { return static_cast<Level>(S().min_level.load()); }
+auto Log::MinLevel() -> Level {
+    return static_cast<Level>(S().min_level.load());
+}
 
 // The formatting path below intentionally uses printf-style C variadics and
 // fixed stack buffers: this is the low-level logging primitive that runs inside
@@ -140,8 +146,8 @@ auto Log::MinLevel() -> Level { return static_cast<Level>(S().min_level.load());
 // matters. The cppcoreguidelines/cert vararg + C-array + bounds checks do not
 // apply to this deliberate design, so they are suppressed locally.
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-bounds-array-to-pointer-decay,cppcoreguidelines-pro-bounds-pointer-arithmetic,cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers,cert-dcl50-cpp,modernize-avoid-variadic-functions,bugprone-easily-swappable-parameters,cert-err33-c,cppcoreguidelines-init-variables)
-void Log::Write(Level level, const char* category, const char* file, int line,
-                const char* fmt, ...) {
+void Log::Write(Level level, const char* category, const char* file, int line, const char* fmt,
+                ...) {
     std::array<char, kBodyBufferSize> body{};
     va_list args;
     va_start(args, fmt);
@@ -152,8 +158,7 @@ void Log::Write(Level level, const char* category, const char* file, int line,
     base = (base != nullptr) ? base + 1 : file;
 
     std::array<char, kHeadBufferSize> head{};
-    std::snprintf(head.data(), head.size(), "[%s][%s][t%llu][%s:%d] ",
-                  LevelTag(level), category,
+    std::snprintf(head.data(), head.size(), "[%s][%s][t%llu][%s:%d] ", LevelTag(level), category,
                   static_cast<unsigned long long>(S().tick.load()), base, line);
 
     std::string line_str;
