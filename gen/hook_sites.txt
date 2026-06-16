@@ -11,3 +11,5 @@ DirectInput_InitMouse
 DirectInput_InitJoystick
 Winsys_Input_InitWin32State
 Snd_InitDevice
+WebLaunch_SetWorkingDirectory
+Installer_RegisterFileAssociations

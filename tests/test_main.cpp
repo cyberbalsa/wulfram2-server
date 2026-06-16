@@ -267,8 +267,8 @@ TEST(GeneratedHeaders, AddressesAndManifestAreSane) {
     // gen/binary_manifest.h: real wulfram2.exe identity. Image base is fixed.
     EXPECT_EQ(wfh::kBinaryManifest.image_base, 0x00400000u);
     // Hook-site byte capture (--hook-bytes 16) emits one HookSite per hook_sites.txt
-    // entry; the table is non-null with exactly 13 captured sites.
-    EXPECT_EQ(wfh::kBinaryManifest.site_count, 13u);
+    // entry; the table is non-null with exactly 15 captured sites.
+    EXPECT_EQ(wfh::kBinaryManifest.site_count, 15u);
     EXPECT_NE(wfh::kBinaryManifest.sites, nullptr);
     EXPECT_NE(wfh::kBinaryManifest.time_date_stamp, 0u);
     EXPECT_NE(wfh::kBinaryManifest.size_of_image, 0u);

@@ -33,6 +33,10 @@ inline constexpr std::uint8_t kSite_Winsys_Input_InitWin32State[] = {
     0x55, 0x8b, 0xec, 0x51, 0xe8, 0x07, 0xf7, 0xff, 0xff, 0xe8, 0x62, 0xfe, 0xff, 0xff, 0xe8, 0x7d};
 inline constexpr std::uint8_t kSite_Snd_InitDevice[] = {
     0x83, 0xec, 0x28, 0xa1, 0xcc, 0x55, 0x5f, 0x00, 0x56, 0x50, 0x8b, 0xf1, 0xe8, 0xeb, 0xaf, 0x03};
+inline constexpr std::uint8_t kSite_WebLaunch_SetWorkingDirectory[] = {
+    0x6a, 0xff, 0x68, 0x58, 0x56, 0x53, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x83, 0xec};
+inline constexpr std::uint8_t kSite_Installer_RegisterFileAssociations[] = {
+    0x6a, 0xff, 0x68, 0x00, 0x57, 0x53, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x83, 0xec};
 
 inline constexpr HookSite kSites[] = {
     {"Client_RunMainLoop", 0x004a0aa0, kSite_Client_RunMainLoop, 16},
@@ -49,9 +53,12 @@ inline constexpr HookSite kSites[] = {
     {"DirectInput_InitJoystick", 0x004b1b50, kSite_DirectInput_InitJoystick, 16},
     {"Winsys_Input_InitWin32State", 0x004b7b50, kSite_Winsys_Input_InitWin32State, 16},
     {"Snd_InitDevice", 0x00489fb0, kSite_Snd_InitDevice, 16},
+    {"WebLaunch_SetWorkingDirectory", 0x004a4db0, kSite_WebLaunch_SetWorkingDirectory, 16},
+    {"Installer_RegisterFileAssociations", 0x004a4180, kSite_Installer_RegisterFileAssociations,
+     16},
 };
 
 inline constexpr BinaryManifest kBinaryManifest{0x45254d1f, 0x00288000, 0x001c45a4,
-                                                0x00400000, kSites,     13};
+                                                0x00400000, kSites,     15};
 
 }  // namespace wfh

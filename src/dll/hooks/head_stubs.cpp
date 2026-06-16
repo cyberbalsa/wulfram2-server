@@ -128,6 +128,63 @@ auto __fastcall Stub_Snd_InitDevice(int* /*self_ecx*/, int /*edx_unused*/) -> in
 }
 
 // ---------------------------------------------------------------------------
+// M3.5 first-run registry-permission gate bypass (two seams).
+//
+// PROBLEM (from the M3.5 smoke, verified in Ghidra 2026-06-16): the boot raises
+// a blocking MessageBoxA ("Can't open nor create registry element:\n
+// HKEY_USERS\.DEFAULT ... run this app first time on an account that can modify
+// the registry!") inside Cfg_RegOpenOrCreateSubkey (0x0047e040 entry; box at
+// 0x0047e0e2), which opens/creates registry keys with KEY_ALL_ACCESS (0xf003f).
+// Two distinct call paths early in Client_Main (0x004186d0) hit it:
+//   1. Cmd_ResolveStartupArgs (0x004183a0) -> Installer_RegisterFileAssociations
+//      (0x004a4180): registers .w2l file associations, MIME types, App Paths, and
+//      the Netscape Navigator URL handlers (Suffixes/Viewers) under HKCU AND
+//      HKEY_USERS\.DEFAULT -- this is the seam raising the .DEFAULT access-denied
+//      box (it touches HKEY_USERS\.DEFAULT, which an unprivileged account cannot
+//      create). Runs FIRST.
+//   2. WebLaunch_SetWorkingDirectory (0x004a4db0): opens HKCU\Software\Wulfram and
+//      sets the working directory. Runs shortly after.
+//
+// A headless server needs NEITHER: it does not register OS file associations /
+// Netscape URL handlers, and it does not need the client's HKCU install-dir
+// config. We bypass BOTH self-contained steps.
+//
+// CHOICE OF STUB POINT (decompilation evidence):
+//   - Stubbing the shared leaf Cfg_RegOpenOrCreateSubkey is UNSAFE: it is
+//     `void __fastcall(char* subkeyName)` that does not return a status but writes
+//     the opened HKEY back into its caller object at EDI+0x10 (out-param via a
+//     register-passed `this`); a no-op would leave that HKEY stale and break the
+//     callers that subsequently use it. So we stub the two SELF-CONTAINED callers
+//     instead, each of which Client_Main calls for its side effects and never
+//     reads a result back from.
+//   - Installer_RegisterFileAssociations: Ghidra types it `__fastcall(char*)` with
+//     its one argument in ECX (prologue `MOV ESI,ECX`), no return value used by
+//     its caller, bare `ret` epilogue. The __fastcall detour shape (ECX=arg1,
+//     EDX=dummy) matches byte-for-byte; zero stack args means zero callee cleanup,
+//     matching the bare `ret`.
+//   - WebLaunch_SetWorkingDirectory: `void __cdecl(void)` (no params, plain `ret`
+//     epilogue, caller-clean) -- the safest possible detour shape.
+//
+// FIX: detour BOTH to no-ops that return immediately without running the
+// originals, so neither registry-write path (and thus neither MessageBox) ever
+// executes.
+
+// void __cdecl(void). Caller-clean, no arguments, no return value. A __cdecl no-op
+// detour matches byte-for-byte (verified: target epilogue is a bare `ret`).
+auto __cdecl Stub_WebLaunch_SetWorkingDirectory() -> void {
+    WFH_DEBUG("hook", "bypassed WebLaunch_SetWorkingDirectory");
+}
+
+// __fastcall(char* cmdline_in_ECX) -> void. Same MinHook __fastcall shim as
+// Stub_Snd_InitDevice: ECX holds the single register argument, EDX is an unused
+// dummy, and there are no stack args, so the bare-`ret` callee cleanup matches the
+// target's __fastcall frame exactly (verified: target epilogue is a bare `ret`).
+auto __fastcall Stub_Installer_RegisterFileAssociations(char* /*cmdline_ecx*/, int /*edx_unused*/)
+    -> void {
+    WFH_DEBUG("hook", "bypassed Installer_RegisterFileAssociations");
+}
+
+// ---------------------------------------------------------------------------
 // M3.4 render-driver defense.
 //
 // PROBLEM (from the Ghidra trace, verified 2026-06-16): with the head *_Init
@@ -272,6 +329,33 @@ auto InstallRenderDriverDefense() -> bool {
     return true;
 }
 
+// M3.5: install the first-run registry-gate bypass detours (see the block above
+// Stub_WebLaunch_SetWorkingDirectory). Both seams that write the registry early in
+// Client_Main are short-circuited: Installer_RegisterFileAssociations (file
+// associations + Netscape URL handlers, the .DEFAULT box) and
+// WebLaunch_SetWorkingDirectory (HKCU\Software\Wulfram config). Returns true on
+// success; logs and returns false on the first MinHook error. The detours never
+// call through, so each trampoline is discarded.
+auto InstallRegistryGateBypass() -> bool {
+    void* original = nullptr;
+    if (!InstallDetour(TargetAt(addr::Installer_RegisterFileAssociations),
+                       AsVoidPtr(&Stub_Installer_RegisterFileAssociations), &original)) {
+        WFH_FATAL("head",
+                  "M3.5: failed to install Installer_RegisterFileAssociations bypass detour");
+        return false;
+    }
+    WFH_INFO("head", "M3.5 bypass detour installed: Installer_RegisterFileAssociations");
+
+    original = nullptr;
+    if (!InstallDetour(TargetAt(addr::WebLaunch_SetWorkingDirectory),
+                       AsVoidPtr(&Stub_WebLaunch_SetWorkingDirectory), &original)) {
+        WFH_FATAL("head", "M3.5: failed to install WebLaunch_SetWorkingDirectory bypass detour");
+        return false;
+    }
+    WFH_INFO("head", "M3.5 bypass detour installed: WebLaunch_SetWorkingDirectory");
+    return true;
+}
+
 }  // namespace
 
 auto InstallHeadStubs() -> bool {
@@ -309,6 +393,13 @@ auto InstallHeadStubs() -> bool {
     }
 
     WFH_INFO("head", "all %zu head stubs installed", kHeadStubCount);
+
+    // M3.5: bypass the first-run registry-permission gate
+    // (WebLaunch_SetWorkingDirectory), which otherwise raises a blocking
+    // MessageBox early in Client_Main, before the render path.
+    if (!InstallRegistryGateBypass()) {
+        return false;
+    }
 
     // M3.4: short-circuit Render_SwitchActiveDriver and install a non-null no-op
     // render driver, so the boot does not hit the "no usable display mode" error

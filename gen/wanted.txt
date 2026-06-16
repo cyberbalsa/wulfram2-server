@@ -16,3 +16,5 @@ DirectInput_InitJoystick
 Winsys_Input_InitWin32State
 Snd_InitDevice
 Voice_InitSystem
+WebLaunch_SetWorkingDirectory
+Installer_RegisterFileAssociations

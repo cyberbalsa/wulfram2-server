@@ -24,6 +24,8 @@ constexpr std::uint32_t DirectInput_InitJoystick = 0x004b1b50;
 constexpr std::uint32_t Winsys_Input_InitWin32State = 0x004b7b50;
 constexpr std::uint32_t Snd_InitDevice = 0x00489fb0;
 constexpr std::uint32_t Voice_InitSystem = 0x0048b680;
+constexpr std::uint32_t WebLaunch_SetWorkingDirectory = 0x004a4db0;
+constexpr std::uint32_t Installer_RegisterFileAssociations = 0x004a4180;
 
 }  // namespace addr
 }  // namespace wfh
