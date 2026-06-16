@@ -6,6 +6,7 @@
 
 #include "addresses.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,11 @@
 // NOLINTBEGIN(cppcoreguidelines-avoid-do-while,cppcoreguidelines-pro-type-vararg)
 namespace wfh {
 namespace {
+
+// Turns an absolute VA into a void* target (see the definition below for the
+// reinterpret_cast rationale). Forward-declared so the M3.4 detour, defined above
+// it, can reuse it instead of open-coding the int->ptr cast.
+auto TargetAt(std::uint32_t address) -> void*;
 
 // ---------------------------------------------------------------------------
 // The 11 head detours. CRITICAL: MinHook invokes each detour in place of the
@@ -121,6 +127,98 @@ auto __fastcall Stub_Snd_InitDevice(int* /*self_ecx*/, int /*edx_unused*/) -> in
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// M3.4 render-driver defense.
+//
+// PROBLEM (from the Ghidra trace, verified 2026-06-16): with the head *_Init
+// seams stubbed, the boot still dies in Render_SwitchActiveDriver (0x00485f70,
+// called from Client_Main 0x004186d0). Render_SwitchActiveDriver enumerates the
+// display-driver registry via Winsys_SelectBestUsableRenderer (0x004b9aa0); with
+// no usable renderer headless, that function calls Sys_ErrorBoxAndExit("Hokey
+// Display Card or Driver?", "Can't find a usable display mode...") -- this is the
+// "Error" message box observed, not an access violation. Even if that were
+// bypassed, Client_Main later dereferences the render-driver object DAT_00677e54
+// directly: (*(code*)DAT_00677e54[0x18])(0) and DAT_00677e54[0x12](...), so a
+// detour that merely returns without leaving a non-null DAT_00677e54 would then
+// NULL-deref.
+//
+// FIX: detour Render_SwitchActiveDriver to install a non-null no-op driver object
+// into DAT_00677e54 and return 1 (success), WITHOUT running the original (so the
+// renderer enumeration / error box never executes). All later DAT_00677e54[idx]
+// dispatches then land on no-op thunks.
+//
+// ABI of the driver "vtable": the engine calls these slots caller-cleanup and
+// with a VARYING argument count at the same index (e.g. slot 0xb is called with
+// 2 args in Render_SwitchActiveDriver and 3 args in Render_InitDriverAndViewports,
+// with `this` passed explicitly as the first stack arg, not in ECX). Only
+// caller-cleanup __cdecl tolerates a fixed thunk under a varying arg count, so the
+// no-op thunk is __cdecl with a bare `ret` -- correct regardless of how many args
+// any given slot is invoked with. Verified against the decompiled call sites.
+//
+// VA of the global render-driver object pointer, from the M3 discovery
+// (DAT_00677e54). Not in gen/addresses.h (that file lists functions only), so it
+// is pinned here as the absolute VA the RE established.
+constexpr std::uint32_t kRenderDriverPtrVA = 0x00677e54;
+
+// A single caller-cleanup no-op returning 0. Used for every driver-object slot
+// and every entry of the stub vtable. __cdecl == caller-cleanup, so a bare `ret`
+// is stack-safe no matter how many arguments a call site pushes.
+auto __cdecl RenderDriver_NoOp() -> int {
+    return 0;
+}
+
+// Layout the engine assumes for the render-driver object (DAT_00677e54):
+//   - slot [0] is a POINTER to a vtable (the engine does (**(code**)*obj)()),
+//   - every other slot [idx] is itself a function pointer (the engine does
+//     (*(code*)obj[idx])(...)).
+// We satisfy both: slot [0] points at an all-no-op vtable; slots [1..] each hold
+// the no-op thunk directly. Sized well past the highest index/field the boot path
+// touches (max observed ~0x19 as a call, +0xd8 as a field) so any stray field
+// read yields a harmless non-null value rather than running off the object.
+constexpr std::size_t kStubDriverSlots = 0x100;
+
+struct StubRenderDriver {
+    std::array<void*, kStubDriverSlots> vtable;
+    std::array<void*, kStubDriverSlots> object;
+};
+
+// Static storage: lives for the process lifetime, so DAT_00677e54 stays valid for
+// every later dispatch. Filled once on first install. It is intentionally a
+// mutable namespace-scope object: it IS the render-driver instance the engine
+// dispatches through, so it cannot be const.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+StubRenderDriver g_stub_driver{};
+
+auto StubDriverObject() -> void* {
+    // `thunk` is stored into arrays of void* (non-const), so it must itself be a
+    // non-const void*; cppcheck's pointer-to-const suggestion does not apply here.
+    // cppcheck-suppress constVariablePointer
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    void* const thunk = reinterpret_cast<void*>(&RenderDriver_NoOp);
+    std::fill(g_stub_driver.vtable.begin(), g_stub_driver.vtable.end(), thunk);
+    std::fill(g_stub_driver.object.begin(), g_stub_driver.object.end(), thunk);
+    // Slot [0] of the object must be the vtable pointer, not a raw thunk.
+    g_stub_driver.object.front() = static_cast<void*>(g_stub_driver.vtable.data());
+    return static_cast<void*>(g_stub_driver.object.data());
+}
+
+// M3.4: replaces Render_SwitchActiveDriver. Installs the non-null no-op driver and
+// reports success; never calls the original (so Winsys_SelectBestUsableRenderer /
+// the "Hokey Display Card" error box never runs). Returns 1 (uint success), which
+// is what Client_Main and the other callers test.
+//
+// uint __cdecl Render_SwitchActiveDriver(void) -- signature confirmed in Ghidra.
+auto __cdecl Stub_Render_SwitchActiveDriver() -> unsigned {
+    // Writing the engine global at its fixed VA is the whole point of this detour;
+    // the int->ptr cast and the fixed-address store are intentional and safe.
+    // TargetAt() carries the int->ptr NOLINT; the void*->void** cast is benign.
+    auto** const driver_ptr = static_cast<void**>(TargetAt(kRenderDriverPtrVA));
+    // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
+    *driver_ptr = StubDriverObject();
+    WFH_INFO("head", "M3.4: Render_SwitchActiveDriver short-circuited; no-op driver installed");
+    return 1U;
+}
+
 // One entry per seam. `target` is the absolute VA from gen/addresses.h; `detour`
 // is the matching stub above. reinterpret_cast on both ends is unavoidable:
 // turning an absolute integer address and a typed function pointer into the
@@ -157,6 +255,20 @@ auto InstallLoopObservationDetour() -> bool {
         return false;
     }
     WFH_INFO("head", "TEMP (M3) observation detour installed: Client_RunMainLoop");
+    return true;
+}
+
+// M3.4: install the Render_SwitchActiveDriver defense detour (see the block above
+// Stub_Render_SwitchActiveDriver). Returns true on success; logs and returns false
+// on MinHook error. The detour never calls through, so the trampoline is discarded.
+auto InstallRenderDriverDefense() -> bool {
+    void* original = nullptr;
+    if (!InstallDetour(TargetAt(addr::Render_SwitchActiveDriver),
+                       AsVoidPtr(&Stub_Render_SwitchActiveDriver), &original)) {
+        WFH_FATAL("head", "M3.4: failed to install Render_SwitchActiveDriver defense detour");
+        return false;
+    }
+    WFH_INFO("head", "M3.4 defense detour installed: Render_SwitchActiveDriver");
     return true;
 }
 
@@ -197,6 +309,13 @@ auto InstallHeadStubs() -> bool {
     }
 
     WFH_INFO("head", "all %zu head stubs installed", kHeadStubCount);
+
+    // M3.4: short-circuit Render_SwitchActiveDriver and install a non-null no-op
+    // render driver, so the boot does not hit the "no usable display mode" error
+    // box and later DAT_00677e54 dispatches land on no-op thunks.
+    if (!InstallRenderDriverDefense()) {
+        return false;
+    }
 
     // TEMP (M3): observation-only; M4 replaces the loop body. Install the loop
     // seam observation detour alongside the head stubs, so it is live before the
