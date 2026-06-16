@@ -96,7 +96,18 @@ connect-gate spoof — inactive in `05dd6ca`.) M4 refinements still open: explic
 The persistent loop pumps the CLIENT's single connection; there is **no in-binary listen/accept for game
 traffic** (the `Net_InitAccept*` server primitives are only wired to the DbgNet debug port 6969). So the
 original "all-in-C++ injected server reusing Net_*" assumption doesn't hold as-is. To make this an authoritative
-server requires a topology decision (see below) — **DECISION NEEDED before M5.**
+server requires a topology decision.
+
+### M5 DECISION (2026-06-16): all-in-DLL, approach B + engine owns the world
+**Topology:** build the server in the injected DLL (all-in-one process). **Networking = B** — independent C++
+socket server speaking the proven `Wulf-Forge` framing (NOT the engine's client-side Net accept machinery).
+**HARD CONSTRAINT (user):** the ENGINE owns/tracks the whole object world — spawn all entities into its own
+pools via `World_InitState`/`SpatialRoot_InitFromMap`/`CollisionSystem_InitGlobals`/`Game_EnterWorldAsObject`/
+`Obj_InitFromSpawn`, so its NATIVE collision/spatial-index/raycast/hit-detection work on real objects. No
+parallel object model or reimplemented collision in C++. See `memory/m5-server-topology-all-in-dll.md`.
+M5.0 RE complete (`49ad05b`): full handshake (HELLO ver `0x4E89`), entity contract (euler orient `+0x30`,
+health `+0xD0`…), and the 5 "gamestate-bad" traps the headless design avoids. **Driving M5 in tight,
+controller-reviewed steps** (the prior autonomous agent overran repeatedly; now done).
 
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
