@@ -24,7 +24,9 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
 - [x] **Task 0** — Repo + CMake skeleton + MinHook v1.3.4 + strict flags. Commits `f52c342`, `df27c7c`, `16378cc`.
 - [x] **Task 1** — Logging subsystem (leveled async, file + OutputDebugString). Commits `841421f`, `f086fd8`
       (hardening: idempotent `Init`, safe `~State` teardown). Both reviews passed.
-- [ ] **Task 1.5** — Install clang-tidy + cppcheck; migrate tests to GoogleTest; wire lint. *(in progress)*
+- [x] **Task 1.5** — clang-tidy + cppcheck installed; tests migrated to GoogleTest (FetchContent + CTest);
+      `lint.ps1` gate (clang-tidy + cppcheck) green. Commits `c4ffa26`, `97ef444`. Verified: ctest 2/2, lint PASS.
+- [ ] **Task 1.6** — Git hooks (`.githooks/` + core.hooksPath): pre-push zero-warning + lint + ctest gate. *(next)*
 - [ ] **Task 2** — Loader arg parsing
 - [ ] **Task 3** — PE manifest model + validator
 - [ ] **Task 4** — Injector + loader main
