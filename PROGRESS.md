@@ -65,7 +65,15 @@ Next: **Milestone 3 — head-chop** (stub the 12 `*_Init` seams, capture real ho
 headless boot to the loop seam). Design input: `docs/superpowers/notes/2026-06-16-m3-head-chop-discovery.md`
 — key finding: head/body are decoupled (no body-init reads head globals), so 11/12 seams are plain-stubbable.
 
-## Milestone 3 — Head-Chop (in progress)
+## ⟳ M3 APPROACH PIVOT (2026-06-16): head-chop → boot hidden (Approach B)
+The head-chop (stub every `*_Init`) hit an open-ended NULL-deref cascade (driver vtable → viewport →
+keystate → …). **Decision: switch to Approach B** — let the engine boot its built-in SOFTWARE renderer
+into a HIDDEN window (it allocates its own state, no NULL-derefs), force "Software Windowed", keep only the
+real env bypasses (registry/browser), then hijack `Client_RunMainLoop` for the server tick (per-frame render
+never runs). See `memory/m3-approach-b-boot-hidden.md`. The M3.1-M3.9 head-chop commits stay in history (they
+map the boot path); the live install path will be reworked. Running in tight, reviewed steps from here.
+
+## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
 - [x] **M3.1** — generator captures real hook-site bytes (RVA→file-offset); `binary_manifest.h` has 13 sites
       with real `wulfram2.exe` bytes; self-check now validates them. Commit `ab2c7b2`. 15/15 ctest, pytest 2/2.
