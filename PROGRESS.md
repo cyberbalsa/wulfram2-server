@@ -29,7 +29,8 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
 - [x] **Task 1.6** — Git hooks (`.githooks/` + `core.hooksPath`): pre-commit clang-format check; pre-push
       hard gate (build `/W4 /WX` zero-warning + `lint.ps1` + ctest). Verified blocks a warning & a mis-format.
       Commits `e8b4341`, `5f99f16`. Docs: `docs/quality-gate.md`. (pre-push uses `pwsh`; hooks pinned LF.)
-- [ ] **Task 2** — Loader arg parsing
+- [x] **Task 2** — Loader arg parsing (`ParseLoaderArgs` + `CreateInjectionPlan`, GoogleTest). Commit `92f5a01`.
+      Verified green via the live pre-push gate (build + lint + ctest).
 - [ ] **Task 3** — PE manifest model + validator
 - [ ] **Task 4** — Injector + loader main
 - [ ] **Task 5** — `gen_addresses.py` generator
