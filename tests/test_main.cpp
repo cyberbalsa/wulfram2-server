@@ -1,3 +1,4 @@
+#include "wfh/injector.hpp"
 #include "wfh/log.hpp"
 
 #include <gtest/gtest.h>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -54,4 +56,21 @@ TEST(LogTest, DoubleInitIsSafe) {
         ++count;
     }
     EXPECT_EQ(count, std::size_t{1});
+}
+
+TEST(LoaderArgs, ResolvesPaths) {
+    std::vector<std::wstring> argv = {L"C:\\tools\\loader.exe", L"C:\\game\\wulfram2.exe", L"-port",
+                                      L"2627"};
+    const auto r = wfh::ParseLoaderArgs(argv);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.value.game_exe_path, std::filesystem::path(L"C:\\game\\wulfram2.exe"));
+    EXPECT_EQ(r.value.dll_path.filename(), std::filesystem::path(L"wulf_headless.dll"));
+    EXPECT_EQ(r.value.dll_path.parent_path(), std::filesystem::path(L"C:\\tools"));
+    EXPECT_EQ(r.value.game_arguments, L"-port 2627");
+}
+
+TEST(LoaderArgs, RequiresExe) {
+    std::vector<std::wstring> argv = {L"loader.exe"};
+    const auto r = wfh::ParseLoaderArgs(argv);
+    EXPECT_FALSE(r.ok);
 }
