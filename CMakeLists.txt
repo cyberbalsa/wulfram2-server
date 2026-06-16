@@ -26,6 +26,25 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# GoogleTest for the test harness. Pinned tag, shallow clone. It inherits the
+# x86/MSVC toolchain from the top-level configure (vcvars32), so it builds 32-bit.
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2
+    GIT_SHALLOW TRUE
+)
+# Match our targets' CRT (we build with the dynamic CRT under MSVC); otherwise
+# gtest defaults to the static CRT on Windows and link errors result. Must be
+# set BEFORE FetchContent_MakeAvailable(googletest).
+if(MSVC)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+endif()
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+include(GoogleTest)
+
 # MinHook v1.3.4 ships its own CMakeLists.txt, so FetchContent_MakeAvailable
 # defines the `minhook` target itself and this block does not run. It is kept
 # as a defensive fallback: older tags (e.g. v1.3.3) ship no CMakeLists, leaving
@@ -58,7 +77,8 @@ target_include_directories(wulf_headless PRIVATE include gen)
 target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe minhook dbghelp)
 
 add_executable(wfh_tests tests/test_main.cpp)
-target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_loader_core)
+target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_loader_core GTest::gtest_main)
+gtest_discover_tests(wfh_tests)
 
 set(WFH_TARGETS wfh_log wfh_pe wfh_loader_core loader wulf_headless wfh_tests)
 

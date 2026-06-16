@@ -19,6 +19,14 @@ if (-not $CMake) {
     }
 }
 
+# ctest lives next to cmake; resolve it from the same directory so we do not
+# depend on it being separately on PATH.
+$CTest = Join-Path (Split-Path $CMake -Parent) "ctest.exe"
+if (-not (Test-Path $CTest)) {
+    $CTestCmd = (Get-Command ctest -ErrorAction SilentlyContinue)?.Source
+    if ($CTestCmd) { $CTest = $CTestCmd } else { throw "ctest not found next to cmake or on PATH" }
+}
+
 $StrictVal = [int][bool]$Strict
 
 cmd /c "`"$VcVars`" && `"$CMake`" -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=$Config -DWFH_STRICT=$StrictVal"
@@ -26,6 +34,8 @@ if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 cmd /c "`"$VcVars`" && `"$CMake`" --build $BuildDir"
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 if (-not $SkipTests) {
-    & ".\$BuildDir\wfh_tests.exe"
+    # Run the GoogleTest suite through CTest (tests are registered via
+    # gtest_discover_tests). Go through vcvars32 so the x86 runtime is on PATH.
+    cmd /c "`"$VcVars`" && `"$CTest`" --test-dir $BuildDir --output-on-failure"
     if ($LASTEXITCODE -ne 0) { throw "tests failed" }
 }
