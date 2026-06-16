@@ -911,6 +911,39 @@ TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
     std::filesystem::remove_all(root);
 }
 
+// M6.1: when a world provider is set (the engine read), the snapshot sent to clients
+// is the real engine world, replacing the MVP placeholder static pads / session tanks.
+TEST(MvpOnlineBridge, WorldProviderOverridesSnapshotWithEngineEntities) {
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "no_such_map_for_provider_test";  // no state file -> fallback pads exist
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    // One authoritative engine tank; this must be what the client sees (not the pads).
+    bridge.SetWorldProvider([] {
+        MvpEntitySnapshot tank;
+        tank.net_id = 99;
+        tank.unit_type = 1;
+        tank.team = 2;
+        tank.is_manned = true;
+        tank.pos = {2437.0F, 3269.0F, -180.0F};
+        return std::vector<MvpEntitySnapshot>{tank};
+    });
+
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 1, 0, 0.0F, 0, 0, 0, "alice"});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+    bridge.Tick(7);
+
+    const auto snapshot = FirstViewUpdateForSession(outbound.DrainAll(), 1);
+    ASSERT_TRUE(snapshot.has_value());
+    const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
+    ASSERT_EQ(entities.size(), 1U);  // only the engine entity, not the fallback pads
+    EXPECT_EQ(entities.at(0).net_id, 99);
+    EXPECT_EQ(entities.at(0).unit_type, 1U);
+    EXPECT_EQ(entities.at(0).team, 2U);
+}
+
 TEST(Connection, VersionMismatchDrops) {
     ServerConfig cfg;
     IncomingCmdQueue inbound;

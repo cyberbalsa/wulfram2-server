@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <string_view>
@@ -66,6 +67,13 @@ public:
 
     void Tick(std::uint32_t sequence);
 
+    // Returns the authoritative world to replicate (the M6.1 engine read). When set,
+    // its result REPLACES the MVP placeholder entities (static pads + session tanks)
+    // in every VIEW_UPDATE, so clients see the engine's real world. The provider is
+    // invoked on the tick thread during snapshot emission.
+    using WorldProvider = std::function<std::vector<MvpEntitySnapshot>()>;
+    void SetWorldProvider(WorldProvider provider);
+
 private:
     struct SessionState {
         std::uint64_t session_id = 0;
@@ -102,8 +110,12 @@ private:
     std::map<std::uint64_t, SessionState> sessions_;
     std::vector<MvpEntitySnapshot> static_entities_;
     std::int32_t next_entity_id_ = 1;
+    WorldProvider world_provider_;  // when set, supplies the authoritative world (M6.1)
 };
 
+// The process-lifetime MVP bridge (also the M6.1 relay once a world provider is set).
+// Exposed so the engine-glue tick can arm its world provider with the live engine read.
+[[nodiscard]] auto ProcessMvpBridge() -> MvpOnlineBridge&;
 void ProcessMvpOnlineTick(std::uint32_t sequence);
 
 }  // namespace wfh::server

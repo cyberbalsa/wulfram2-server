@@ -301,9 +301,30 @@ the foundation for the replication relay.
   `lint.ps1` = **PASS** (cppcheck/clang-tidy analyze with 64-bit models, so `DerefU32` returns
   `uint32` to dodge a spurious truncation finding; the asm-only `engine_thunks.cpp` stays clang-tidy
   excluded).
-- **Next (M6.1-min(b)):** feed `ReadEngineWorld()` to connected sessions as `VIEW_UPDATE` (the encoder
-  + session fanout already exist + are tested) so a real rendering client sees the server's
-  authoritative tank; diff per-client for create/update/destroy comes after broadcast-to-all works.
+### ✅ M6.1-min(b) — authoritative relay wired: clients receive the engine world (2026-06-16)
+The replication path now sources its `VIEW_UPDATE` entities from the live engine world instead of MVP
+placeholder data, so a connecting client sees the server's real objects.
+- **TDD (host-tested):** `MvpOnlineBridge::SetWorldProvider(std::function<vector<MvpEntitySnapshot>()>)`
+  — when set, `EntitySnapshots()` returns the provider's result, REPLACING the placeholder pads/session
+  tanks in every `VIEW_UPDATE`. New gtest `WorldProviderOverridesSnapshotWithEngineEntities`: a session
+  joins + WANT_UPDATES, and the emitted snapshot carries exactly the provider's one engine tank
+  (oid/type/team), not the fallback pads.
+- **Glue wiring:** exposed the bridge as a process singleton (`ProcessMvpBridge()`); when the world-host
+  bootstrap completes, the tick arms the provider with `[]{ return ReadEngineWorld(); }` (runs on the
+  tick thread during emission). The existing `BuildViewUpdateSnapshot` encoder + per-session fanout are
+  reused unchanged.
+- **Smoke (injected, cleaned up):** logs `world-host bootstrap complete` →
+  `authoritative relay armed: clients now receive the engine world`, and the readback shows the real
+  tank (`oid=1 type=1 pos=2437,3269,-180`); no fault. Build = **94/94 CTest**, `lint.ps1` = **PASS**.
+  (Socket tests can transiently flake under ctest right after a smoke — TIME_WAIT on the ephemeral
+  binds; they pass once the OS settles / in a single-process run.)
+- **End-to-end note:** the bridge logic (provider → VIEW_UPDATE) is host-proven and the live provider
+  returns the real entity, so a connecting client receives the engine world by composition. The final
+  confirmation — an external rendering client visibly seeing the server's tank — is a controller smoke
+  (as with the M5.1e entry-map render check).
+- **Next:** per-tick relay cadence + per-client create/update/destroy diffing (currently emits on
+  join); then **M5.2** per-entity control injection so client inputs drive their server-side tank;
+  health/energy level↔absolute normalization (M5.0 trap #5); default `world_host` on.
 
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.

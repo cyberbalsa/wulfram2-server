@@ -647,6 +647,10 @@ MvpOnlineBridge::MvpOnlineBridge(IncomingCmdQueue& inbound, OutboundStateQueue& 
     LoadMapBootstrap();
 }
 
+void MvpOnlineBridge::SetWorldProvider(WorldProvider provider) {
+    world_provider_ = std::move(provider);
+}
+
 void MvpOnlineBridge::Tick(std::uint32_t sequence) {
     bool visibility_changed = false;
     for (const ClientCommand& cmd : inbound_->DrainAll()) {
@@ -877,6 +881,11 @@ void MvpOnlineBridge::EmitRosterCatchup(const SessionState& joined) {
 }
 
 auto MvpOnlineBridge::EntitySnapshots() const -> std::vector<MvpEntitySnapshot> {
+    // M6.1: when the engine world provider is set it is the authoritative source —
+    // its entities REPLACE the MVP placeholder pads/session tanks entirely.
+    if (world_provider_) {
+        return world_provider_();
+    }
     std::vector<MvpEntitySnapshot> entities;
     entities.reserve(static_entities_.size() + sessions_.size());
     entities.insert(entities.end(), static_entities_.begin(), static_entities_.end());
@@ -929,12 +938,16 @@ void MvpOnlineBridge::EmitSnapshots(std::uint32_t sequence) {
     }
 }
 
-void ProcessMvpOnlineTick(std::uint32_t sequence) {
+auto ProcessMvpBridge() -> MvpOnlineBridge& {
     // Process lifetime, mirroring ProcessRuntime(): avoids DLL teardown ordering work.
     // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     static auto* const bridge = new MvpOnlineBridge(
         ProcessRuntime().Inbound(), ProcessRuntime().Outbound(), RuntimeWorldBootstrapConfig());
-    bridge->Tick(sequence);
+    return *bridge;
+}
+
+void ProcessMvpOnlineTick(std::uint32_t sequence) {
+    ProcessMvpBridge().Tick(sequence);
 }
 
 }  // namespace wfh::server

@@ -7,6 +7,7 @@
 #include "wfh/server/runtime.hpp"
 #include "wfh/server/server_config.hpp"
 #include "wfh/server/world_host.hpp"
+#include "wfh/server/world_packets.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -203,6 +204,13 @@ void ProcessWorldHostTick() {
     static bool logged_done = false;
     if (bootstrap.done() && !logged_done) {
         WFH_INFO("worldhost", "world-host bootstrap complete");
+        // Arm the authoritative relay: the MVP bridge now sources its VIEW_UPDATE
+        // entities from the live engine world instead of placeholder data, so
+        // connected clients see the engine's real objects. The provider runs on this
+        // tick thread during the bridge's snapshot emission.
+        ProcessMvpBridge().SetWorldProvider(
+            []() -> std::vector<MvpEntitySnapshot> { return ReadEngineWorld(); });
+        WFH_INFO("worldhost", "authoritative relay armed: clients now receive the engine world");
         logged_done = true;
     }
 
