@@ -38,7 +38,9 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
 - Note: **reordered Task 5 (generator) before Task 4 (injector)** — injector.cpp includes the
       generated `binary_manifest.h`, so the generator must run first to keep the gate green.
 - [ ] **Task 4** — Injector + loader main
-- [ ] **Task 5** — `gen_addresses.py` generator
+- [x] **Task 5** — `gen_addresses.py` + pytest; generated `addresses.h` (17 consts) + `binary_manifest.h`
+      with real `wulfram2.exe` stamps (stamp `0x45254d1f`, size `0x288000`, sum `0x1c45a4`, base `0x400000`).
+      gtest static-asserts the headers. Commit `20d1448`. 11/11 ctest.
 - [ ] **Task 6** — ABI binding typedefs
 - [ ] **Task 7** — DllMain + InitThread
 - [ ] **Task 8** — Config + log level wiring
