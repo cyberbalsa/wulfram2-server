@@ -18,8 +18,8 @@ namespace wfh::server {
 // Like Connection, this class touches NO engine memory and performs NO engine
 // calls — it is fully host-testable by ticking Advance() and asserting the action
 // sequence. The DLL-side engine glue (Game_ResetSession / Client_SetCurrentWorld /
-// Screen_SwitchMode / Obj_Create+Obj_InitFromSpawn) reads the action + plan and
-// performs the real, SEH-guarded engine work.
+// Obj_Create+Obj_InitFromSpawn) reads the action + plan and performs the real,
+// SEH-guarded engine work.
 //
 // Canonical order is load-bearing and mirrors the engine's OWN world-entry
 // (Net_HandleWorldStats @ 0x46cf50 does Game_ResetSession(0) then
@@ -50,15 +50,21 @@ enum class WorldHostPhase : int {
     Complete,  // bring-up done
 };
 
+// Default spawn near the bpass team-1 repair pad (map state `r 1` @ ~2437,3269,-183;
+// world is 5600x5600). In-bounds, on the ground, so the test spawn is sane to verify.
+constexpr float kDefaultSpawnX = 2437.0F;
+constexpr float kDefaultSpawnY = 3269.0F;
+constexpr float kDefaultSpawnZ = -180.0F;
+
 // The one authoritative entity to spawn (M5.4-min proves the spawn/world path with
 // a single object; M6 scales to the full world). Plain value type.
 struct WorldHostEntitySpec {
-    std::int32_t oid = 1;                        // OID handed to Obj_Create (engine registers it)
-    std::int32_t unit_type = 1;                  // engine unit type id (1 = tank)
-    std::int32_t owner = 0;                      // owning player id (0 = server-owned)
-    std::int32_t team = 1;                       // team id
-    std::array<float, 3> pos{0.0F, 0.0F, 0.0F};  // spawn position
-    std::array<float, 3> rot{0.0F, 0.0F, 0.0F};  // spawn euler orientation
+    std::int32_t oid = 1;        // OID handed to Obj_Create (engine registers it)
+    std::int32_t unit_type = 1;  // engine unit type id (1 = tank)
+    std::int32_t owner = 0;      // owning player id (0 = server-owned)
+    std::int32_t team = 1;       // team id
+    std::array<float, 3> pos{kDefaultSpawnX, kDefaultSpawnY, kDefaultSpawnZ};  // spawn position
+    std::array<float, 3> rot{0.0F, 0.0F, 0.0F};                                // euler orientation
 };
 
 // What to bring up: which map and which entity. Defaults match the project map.

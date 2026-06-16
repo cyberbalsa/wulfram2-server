@@ -23,11 +23,11 @@ namespace {
 // Engine-glue bridge for the M5.4 "engine owns the world" bring-up.
 //
 // This replicates the engine's OWN world-entry path (Net_HandleWorldStats @
-// 0x46cf50 does exactly Game_ResetSession(0) -> Client_SetCurrentWorld(...)),
-// plus a flip into the game-view screen mode. Once the world is loaded
-// (DAT_006785e4 != 0), Client_Main's loop ticks the engine's own physics every
-// iteration (Interp_UpdateAllEntities -> Interp_StepSimulationSubsteps), so the
-// engine genuinely owns and advances the world -- no reimplemented simulation.
+// 0x46cf50 does exactly Game_ResetSession(0) -> Client_SetCurrentWorld(...)), then
+// spawns one authoritative entity (Obj_Create + Obj_InitFromSpawn). Once the world
+// is loaded (DAT_006785e4 != 0), Client_Main's loop ticks the engine's own physics
+// every iteration (Interp_UpdateAllEntities -> Interp_StepSimulationSubsteps), so
+// the engine genuinely owns and advances the world -- no reimplemented simulation.
 //
 // VAs pinned here (gen/addresses.h holds only a curated subset; head_stubs.cpp
 // pins its own VAs the same way). Verified in Ghidra against wulfram2.exe
@@ -75,20 +75,41 @@ void DoLoadWorld(char* map_name) {
     WFH_INFO("worldhost", "world loaded; engine loop now ticks physics on its own world list");
 }
 
-void DoSpawnPlaceholder() {
-    // Next M5.4 step: Obj_Create (OID in EBX) + Obj_InitFromSpawn (entity in EAX)
-    // need verified asm register-handoff wrappers; wired in a separate step so the
-    // asm stays isolated for its own review + smoke.
-    WFH_WARN("worldhost", "SpawnEntity: asm register-handoff spawn wrapper not yet wired");
+// Spawn ONE authoritative non-local entity into the loaded world. Mirrors the engine's
+// own Net_HandleTankSpawn: Obj_Create (owner=team, like its teamOrFlag,teamOrFlag pair;
+// creator/is_local/deco = 0) then Obj_InitFromSpawn for transform + world-list/spatial
+// insertion. We leave DAT_005b83e0 = -1 (Game_ResetSession set it), and our oid != -1,
+// so Obj_InitFromSpawn does NOT enter-world / grab the local camera.
+void DoSpawn(const WorldHostEntitySpec& entity) {
+    WFH_INFO("worldhost", "Obj_Create(oid=%d, type=%d, team=%d)", entity.oid, entity.unit_type,
+             entity.team);
+    // creator (ECX, stored at entity+0xcc) must be > the lose-OID threshold DAT_0067cd0c
+    // (0 on a fresh world) for Obj_Create's LoseOid_IsHidden gate to pass — creator=0
+    // is rejected. The engine passes the spawn packet's objectId here; for our
+    // server-owned entity the oid (>0) is a fine positive id. is_local/deco = 0;
+    // owner=team mirrors Net_HandleTankSpawn's (teamOrFlag, teamOrFlag) pair.
+    void* obj = EngineObjCreate(entity.oid, entity.oid, 0, entity.unit_type, entity.team,
+                                entity.team, 0, 0);
+    if (obj == nullptr) {
+        WFH_WARN("worldhost", "Obj_Create returned null (oid=%d rejected); spawn skipped",
+                 entity.oid);
+        return;
+    }
+    WFH_INFO("worldhost", "Obj_InitFromSpawn(oid=%d, pos=%.1f,%.1f,%.1f)", entity.oid,
+             static_cast<double>(entity.pos.at(0)), static_cast<double>(entity.pos.at(1)),
+             static_cast<double>(entity.pos.at(2)));
+    EngineObjInitFromSpawn(obj, entity.pos.at(0), entity.pos.at(1), entity.pos.at(2),
+                           entity.rot.at(0), entity.rot.at(1), entity.rot.at(2));
+    WFH_INFO("worldhost", "spawned entity oid=%d into world list + spatial index", entity.oid);
 }
 
 // Thin dispatch: each case is a single call so the per-action logging do-while
 // macros live in their own small helpers (keeps this under the complexity gate).
-void PerformAction(WorldHostAction action, char* map_name) {
+void PerformAction(WorldHostAction action, char* map_name, const WorldHostEntitySpec& entity) {
     switch (action) {
     case WorldHostAction::ResetSession: DoResetSession(); return;
     case WorldHostAction::LoadWorld: DoLoadWorld(map_name); return;
-    case WorldHostAction::SpawnEntity: DoSpawnPlaceholder(); return;
+    case WorldHostAction::SpawnEntity: DoSpawn(entity); return;
     case WorldHostAction::None: return;
     }
 }
@@ -115,7 +136,7 @@ void ProcessWorldHostTick() {
         bootstrap.Begin();
     }
 
-    PerformAction(bootstrap.Advance(), map_buf.data());
+    PerformAction(bootstrap.Advance(), map_buf.data(), bootstrap.plan().entity);
 
     static bool logged_done = false;
     if (bootstrap.done() && !logged_done) {

@@ -34,4 +34,70 @@ __declspec(naked) void EngineLoadWorld(char*, int, int, float) {
     }
 }
 
+// Obj_Create @ 0x419a70 — ECX=creator, EBX=oid, 6 caller-cleaned stack args; entity
+// returned in EAX. EBX is callee-saved by the C++ caller, so we save/restore it.
+// Frame after `push ebp; mov ebp,esp`:
+//   [ebp+0x08] creator [ebp+0x0c] oid    [ebp+0x10] is_local [ebp+0x14] type
+//   [ebp+0x18] owner   [ebp+0x1c] team   [ebp+0x20] deco5    [ebp+0x24] deco6
+// NOLINTNEXTLINE(readability-named-parameter,hicpp-named-parameter)
+__declspec(naked) auto EngineObjCreate(int, int, int, int, int, int, int, int) -> void* {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        push ebx  // preserve EBX (we load oid into it)
+        mov  eax, [ebp+0x24]  // deco6, pushed right-to-left ...
+        push eax
+        mov  eax, [ebp+0x20]  // deco5
+        push eax
+        mov  eax, [ebp+0x1c]  // team
+        push eax
+        mov  eax, [ebp+0x18]  // owner
+        push eax
+        mov  eax, [ebp+0x14]  // type
+        push eax
+        mov  eax, [ebp+0x10]  // is_local
+        push eax
+        mov  ecx, [ebp+0x08]  // creator -> ECX
+        mov  ebx, [ebp+0x0c]  // oid     -> EBX
+        mov  eax, 419a70h  // Obj_Create -> entity in EAX (or 0)
+        call eax
+        add  esp, 0x18  // caller-clean the 6 stack args (plain-RET callee)
+        pop  ebx  // restore EBX (EAX = return value, untouched)
+        mov  esp, ebp
+        pop  ebp
+        ret
+    }
+}
+
+// Obj_InitFromSpawn @ 0x419880 — entity in EAX, 6 caller-cleaned stack args. Only
+// EAX/EDX are clobbered (both caller-saved), so nothing to preserve.
+// Frame: [ebp+0x08] entity [ebp+0x0c] pos_x [ebp+0x10] pos_y [ebp+0x14] pos_z
+//        [ebp+0x18] rot_x  [ebp+0x1c] rot_y [ebp+0x20] rot_z
+// NOLINTNEXTLINE(readability-named-parameter,hicpp-named-parameter)
+__declspec(naked) void EngineObjInitFromSpawn(void*, float, float, float, float, float, float) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        mov  eax, [ebp+0x20]  // rot_z, pushed right-to-left ...
+        push eax
+        mov  eax, [ebp+0x1c]  // rot_y
+        push eax
+        mov  eax, [ebp+0x18]  // rot_x
+        push eax
+        mov  eax, [ebp+0x14]  // pos_z
+        push eax
+        mov  eax, [ebp+0x10]  // pos_y
+        push eax
+        mov  eax, [ebp+0x0c]  // pos_x
+        push eax
+        mov  eax, [ebp+0x08]  // entity -> EAX
+        mov  edx, 419880h  // Obj_InitFromSpawn
+        call edx
+        add  esp, 0x18  // caller-clean the 6 stack args (plain-RET callee)
+        mov  esp, ebp
+        pop  ebp
+        ret
+    }
+}
+
 }  // namespace wfh::server

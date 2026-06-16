@@ -258,10 +258,31 @@ sim, no local player/camera).
   stable, loop ticks `t63 → 346+`, no crash/fault. **Verified live via cdb:** `DAT_006785e4` =
   `0x0945a3d0` (world map **non-null** → loaded) and `DAT_00677f34` (OidTable) non-null (ready for
   spawns). Repo `config/headless.toml` stays `world_host` OFF; smoke used the build copy.
-- **Next (M5.4-min(b)):** asm register-handoff thunks for `Obj_Create` (OID in EBX) +
-  `Obj_InitFromSpawn` (entity in EAX) to spawn ONE entity into the loaded world (leave
-  `DAT_005b83e0 = -1` so no local-camera grab), confirm it lands in `DAT_006785e4` + spatial index,
-  run ticks → predictable motion. Then read entity structs back → M6.1 authoritative relay.
+### ✅ M5.4-min(b) — spawn one authoritative entity into the loaded world (2026-06-16)
+The world-host now spawns a real engine entity after the load, completing the
+`Reset → Load → Spawn` sequence. The `WorldBootstrap` SpawnEntity step is wired to engine
+glue; **verified live** that the engine's own object lands in its world list + spatial index.
+- **Asm register-handoff thunks** (`engine_thunks.cpp`, all verified from disassembly — every one
+  is plain-`RET`/caller-clean, none is standard `__thiscall`/`__fastcall`):
+  - `EngineObjCreate` → `Obj_Create @ 0x419a70`: **ECX=creator, EBX=oid**, 6 caller-cleaned stack
+    args (is_local, type, owner, team, deco5, deco6), returns entity in **EAX**.
+  - `EngineObjInitFromSpawn` → `Obj_InitFromSpawn @ 0x419880`: **entity in EAX**, 6 caller-cleaned
+    stack args (pos x,y,z + euler). Pushes the entity into `*DAT_006785e4` AND the spatial index.
+- **LoseOid gate (root-caused via cdb):** first spawn returned null. `Obj_Create` calls
+  `LoseOid_IsHidden`, which requires `creator > DAT_0067cd0c` (the lose-OID threshold; read **0** on a
+  fresh world). We passed `creator=0` → `0 < 0` false → null. Fix: pass a positive creator (the oid).
+- **No local-camera grab:** `Obj_InitFromSpawn` only enters-world if entity OID == `DAT_005b83e0`
+  (left −1 by `Game_ResetSession`); our oid=1 ≠ −1, so it stays a non-local object. Confirmed.
+- **Smoke (injected, cleaned up):** full sequence completes (reset → load → Obj_Create →
+  Obj_InitFromSpawn → spawned); process stable, loop ticks to **2874+**, no crash/fault. **Verified
+  live via cdb:** world-list **count = 1** (head==tail, single node); the node's entity has
+  **unit_type=1 (tank), OID=1, pos=(2437,3269,−180)** exactly as spawned, **vel=(0,0,0)** (at rest on
+  the team-1 pad terrain — physically correct). WorldMap dims read back 5600.0 (real bpass).
+  Build = **91/91 CTest**, `lint.ps1` = **PASS**.
+- **Next:** read the engine entity structs back per tick (the engine is now the source of truth) and
+  wire the **M6.1 authoritative relay** (snapshot `DAT_006785e4` → clients), then **M5.2** per-entity
+  control injection so client inputs drive their server-side tank. Also: default `world_host` on once
+  the relay path is in (repo config stays off for now).
 
 ## Milestone 3 (Approach A, head-chop — superseded, kept for the boot-path map it produced)
 Plan: `docs/superpowers/plans/2026-06-16-headless-wulfram-server-m3-head-chop.md`.
