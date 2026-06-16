@@ -10,15 +10,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
-// TEMP (M3.7 diagnostic) — remove after diagnosis. <windows.h> provides
-// RtlCaptureStackBackTrace() and USHORT; <intrin.h> provides _ReturnAddress().
-// Both are only needed by Stub_App_ExitGracefully below.
+// <intrin.h> provides _ReturnAddress(), used by Stub_App_ExitGracefully (M3.7) to
+// identify the calling site so it skips ONLY the boot-time exit.
 #ifdef _MSC_VER
 #pragma warning(push, 0)
 #endif
-#include <windows.h>
-
 #include <intrin.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -36,6 +34,11 @@ namespace {
 // reinterpret_cast rationale). Forward-declared so the M3.4 detour, defined above
 // it, can reuse it instead of open-coding the int->ptr cast.
 auto TargetAt(std::uint32_t address) -> void*;
+
+// M3.9: point the engine's keystate-buffer global (DAT_006785d8) at a static
+// 256-byte buffer. Forward-declared so Stub_Winsys_Input_InitWin32State (defined
+// above the definition) can call it. See the definition for the full rationale.
+void EnsureKeystateBuffer();
 
 // ---------------------------------------------------------------------------
 // The 11 head detours. CRITICAL: MinHook invokes each detour in place of the
@@ -112,9 +115,13 @@ auto __cdecl Stub_DirectInput_InitJoystick() -> unsigned {
     return 0U;
 }
 
-// __cdecl() -> void.
+// __cdecl() -> void. The original allocates the 256-byte keystate buffer
+// (DAT_006785d8) via Winsys_Input_PushKeyboardSnapshot; the body-side input poll
+// (Winsys_Input_PollKeyboardState, run from Client_Main's loop) dereferences it.
+// We skip real Win32 input bring-up but MUST leave that buffer non-null (M3.9).
 auto __cdecl Stub_Winsys_Input_InitWin32State() -> void {
-    WFH_DEBUG("head", "stubbed Winsys_Input_InitWin32State");
+    EnsureKeystateBuffer();
+    WFH_DEBUG("head", "stubbed Winsys_Input_InitWin32State (keystate buffer installed)");
 }
 
 // TEMP (M3): observation-only; M4 replaces the loop body.
@@ -243,55 +250,68 @@ auto __cdecl Stub_Shell_OpenUrlWithDefaultBrowser(void* /*url*/) -> void {
 }
 
 // ---------------------------------------------------------------------------
-// TEMP (M3.7 diagnostic) — remove after diagnosis.
+// M3.7 boot-exit guard.
 //
 // App_ExitGracefully (0x0041db40) is a NORETURN full-shutdown routine ending in
-// _exit(). The headless boot reaches it before Client_RunMainLoop and exits
-// cleanly (code 0). It has ~7 callers; this detour logs WHICH caller fired, the
-// full call chain, and the two args, then CALLS THROUGH to the original via the
-// MinHook trampoline so behavior is UNCHANGED (the game still exits gracefully).
-// This is DIAGNOSIS ONLY: it does not skip, suppress, or alter the exit.
+// _exit(). Diagnosed (M3.7, via _ReturnAddress): the headless boot calls it EARLY
+// in Client_Main, from the call site at 0x00418895 (return address 0x0041889A):
 //
-// ABI: void __cdecl App_ExitGracefully(int param_1, int param_2) — confirmed in
-// Ghidra (caller-clean, two stack args, noreturn). The detour matches it exactly
-// so the trampoline call-through is ABI-correct.
+//   00418869 CMP byte [0x00677f4a],0 / JNZ skip
+//   00418872 CMP byte [0x00679123],0 / JZ  skip      // web-launch guard
+//   0041887b CMP byte [0x00677f48],0 / JNZ skip
+//   00418884 Shell_OpenUrlWithDefaultBrowser(...)     // already no-op'd
+//   00418895 App_ExitGracefully(0, 0)                 // <-- this exit
+//   0041889A ADD ESP,8 ; ... continues into the rest of Client_Main
+//
+// This is the "open the Wulfram website, then quit" product-flow branch. Its guard
+// DAT_00679123 is statically 0 but reads non-zero here at runtime (set via an
+// address with no static writer xref — an indirect/struct store), and is re-set
+// AFTER the WebLaunch stub's early clear, so clearing it there does not hold.
+//
+// FIX: detour App_ExitGracefully and, ONLY when invoked from this exact boot-time
+// call site (return address 0x0041889A) with args (0,0), RETURN instead of running
+// the original. The call site has caller-side cleanup (ADD ESP,8) and falls
+// straight into the rest of Client_Main, so returning is structurally safe and the
+// boot proceeds toward the loop seam. EVERY OTHER caller (the legitimate shutdown
+// sites) calls through unchanged, so real shutdown is intact.
+//
+// ABI: void __cdecl App_ExitGracefully(int, int) — confirmed in Ghidra
+// (caller-clean, two stack args). The detour matches it exactly, so both the
+// trampoline call-through and the early return are ABI-correct.
 
 // Trampoline slot for the call-through. Filled by InstallDetour; this is the ONE
-// head stub that must use a real `original` (the no-op stubs leave it null).
+// head stub that uses a real `original` (the no-op stubs leave it null).
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 void* g_app_exit_gracefully_orig = nullptr;
 
-// Module base of wulfram2.exe. The diagnostic logs each backtrace frame as a
-// module-relative RVA (frame - kModuleBase) so it maps straight onto Ghidra
-// addresses (VA = RVA + 0x00400000), plus the absolute VA for convenience.
+// Module base of wulfram2.exe, used to log the caller as a module-relative RVA.
 constexpr std::uintptr_t kModuleBase = 0x00400000;
 
+// Return address of the boot-time App_ExitGracefully call site in Client_Main
+// (instruction after CALL at 0x00418895). Identifies the one exit to skip.
+constexpr std::uintptr_t kBootExitCallSiteRetAddr = 0x0041889A;
+
 auto __cdecl Stub_App_ExitGracefully(int param_1, int param_2) -> void {
-    // Immediate caller (the instruction after the CALL into App_ExitGracefully).
+    // Immediate caller = the instruction after the CALL into App_ExitGracefully.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     const auto ret_addr = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
-    WFH_WARN("diag",
-             "App_ExitGracefully ENTER args=(0x%X, 0x%X) immediate_caller: RVA=0x%X VA=0x%X",
-             static_cast<unsigned>(param_1), static_cast<unsigned>(param_2),
-             static_cast<unsigned>(ret_addr - kModuleBase), static_cast<unsigned>(ret_addr));
 
-    constexpr USHORT kMaxFrames = 16;
-    std::array<void*, kMaxFrames> frames{};
-    const USHORT captured = RtlCaptureStackBackTrace(0, kMaxFrames, frames.data(), nullptr);
-    for (USHORT i = 0; i < captured; ++i) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        const auto frame = reinterpret_cast<std::uintptr_t>(frames.at(i));
-        const auto frame_va = static_cast<unsigned>(frame);
-        // Only frames inside the 32-bit exe image map to module RVAs; others
-        // (DLLs / the MinHook trampoline) are logged absolute-only.
-        const bool in_module = frame >= kModuleBase && frame < 0x00800000;
-        WFH_WARN("diag", "  frame[%u] VA=0x%X RVA=%s0x%X", static_cast<unsigned>(i), frame_va,
-                 in_module ? "" : "(extern) ",
-                 in_module ? static_cast<unsigned>(frame - kModuleBase) : frame_va);
+    if (ret_addr == kBootExitCallSiteRetAddr) {
+        // The early boot-time browser-then-exit branch. The browser call is already
+        // no-op'd; skip this exit so Client_Main continues toward the loop seam.
+        WFH_INFO("boot",
+                 "M3.7: skipped boot-time App_ExitGracefully(0x%X,0x%X) from Client_Main "
+                 "(RVA=0x%X) — boot continues",
+                 static_cast<unsigned>(param_1), static_cast<unsigned>(param_2),
+                 static_cast<unsigned>(ret_addr - kModuleBase));
+        return;
     }
 
-    // Call through to the original so the game's behavior is unchanged (it still
-    // exits). Same ABI/args. The original is noreturn, so this does not return.
+    // Any other caller is a legitimate shutdown; call through unchanged (noreturn).
+    WFH_WARN("boot",
+             "App_ExitGracefully from VA=0x%X args=(0x%X,0x%X) — calling through (shutdown)",
+             static_cast<unsigned>(ret_addr), static_cast<unsigned>(param_1),
+             static_cast<unsigned>(param_2));
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     auto* const orig = reinterpret_cast<void(__cdecl*)(int, int)>(g_app_exit_gracefully_orig);
     orig(param_1, param_2);
@@ -329,6 +349,18 @@ auto __cdecl Stub_App_ExitGracefully(int param_1, int param_2) -> void {
 // (DAT_00677e54). Not in gen/addresses.h (that file lists functions only), so it
 // is pinned here as the absolute VA the RE established.
 constexpr std::uint32_t kRenderDriverPtrVA = 0x00677e54;
+
+// M3.8 viewport defense. Render_InitDriverAndViewports (which M3.4 no-ops) is what
+// normally allocates the six render viewports (operator_new(0x3c) each) and stores
+// them into these six globals. With it stubbed they stay NULL, and the body-side
+// Viewport_InitManager (0x004283e0, runs unconditionally in Client_Main) does
+// `DAT_00677fa4 = DAT_005f56ac; Viewport_SetProjectionScale(...)`, and
+// Viewport_SetProjectionScale (0x004282d0) reads *DAT_00677fa4 / DAT_00677fa4[1]
+// (the viewport's width/height floats) -> NULL deref (AV at 0x004282e4, confirmed
+// by cdb). Provide one non-null stub viewport with sane dimensions and point all
+// six globals at it so these reads return finite numbers headlessly.
+constexpr std::array<std::uint32_t, 6> kViewportGlobalVAs = {0x005f567c, 0x005f56b8, 0x005f56a8,
+                                                             0x005f552c, 0x005f5698, 0x005f56ac};
 
 // A single caller-cleanup no-op returning 0. Used for every driver-object slot
 // and every entry of the stub vtable. __cdecl == caller-cleanup, so a bare `ret`
@@ -372,6 +404,73 @@ auto StubDriverObject() -> void* {
     return static_cast<void*>(g_stub_driver.object.data());
 }
 
+// Stub viewport size in dwords: covers the 0x3c-byte (15-dword) object the
+// original Render_InitDriverAndViewports allocates, with margin.
+constexpr std::size_t kStubViewportSlots = 0x40;
+
+// M3.8: a single stub viewport object. The engine reads index [0]=width and
+// [1]=height as floats (Viewport_SetProjectionScale / Viewport_RecomputeCachedBounds)
+// and treats other slots as ints/zeros. Width/height are a sane headless default
+// (640x480) so projection math produces finite values. Process-lifetime static;
+// intentionally mutable.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::uint32_t, kStubViewportSlots> g_stub_viewport{};
+
+auto StubViewportObject() -> std::uint32_t {
+    constexpr float kWidth = 640.0F;
+    constexpr float kHeight = 480.0F;
+    std::fill(g_stub_viewport.begin(), g_stub_viewport.end(), 0U);
+    // Reinterpret the float bit patterns into the int slots the engine reads back
+    // as floats. memcpy avoids a strict-aliasing violation.
+    std::memcpy(&g_stub_viewport.at(0), &kWidth, sizeof(float));
+    std::memcpy(&g_stub_viewport.at(1), &kHeight, sizeof(float));
+    // The engine's viewport globals are 32-bit pointer slots in this 32-bit build,
+    // so narrowing the address to uint32 to store there is exactly intended.
+    // cppcheck-suppress CastAddressToIntegerAtReturn
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(g_stub_viewport.data()));
+}
+
+// M3.8: point all six render-viewport globals at the one stub viewport, so the
+// unconditional Viewport_InitManager path (and any later viewport read) sees a
+// non-null object with finite dimensions instead of the NULL left by the stubbed
+// Render_InitDriverAndViewports.
+void InstallStubViewports() {
+    const std::uint32_t viewport = StubViewportObject();
+    for (const std::uint32_t global_va : kViewportGlobalVAs) {
+        // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
+        *static_cast<std::uint32_t*>(TargetAt(global_va)) = viewport;
+    }
+    WFH_INFO("head", "M3.8: installed stub viewport (640x480) into 6 viewport globals");
+}
+
+// VA of the engine keystate-buffer pointer (DAT_006785d8). The original
+// Winsys_Input_PushKeyboardSnapshot malloc's 256 bytes and stores them here; the
+// body loop's Winsys_Input_PollKeyboardState reads/writes *(DAT_006785d8 + i) for
+// i in [0,0x100). Pinned VA (functions-only addresses.h).
+constexpr std::uint32_t kKeystateBufferPtrVA = 0x006785d8;
+
+// Keystate buffer size: the engine indexes it for virtual-key codes [0, 0x100).
+constexpr std::size_t kKeystateBufferSize = 0x100;
+
+// 256-byte keystate buffer the engine expects DAT_006785d8 to point at. Static,
+// zero-initialized, process lifetime. Intentionally mutable: the engine reads and
+// writes it every input poll.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::uint8_t, kKeystateBufferSize> g_keystate_buffer{};
+
+// M3.9: ensure DAT_006785d8 is non-null. Idempotent (only sets it if still null),
+// so it is safe even if the engine later allocates its own. Called from the
+// Winsys_Input_InitWin32State stub, before the body loop polls input.
+void EnsureKeystateBuffer() {
+    auto** const slot = static_cast<void**>(TargetAt(kKeystateBufferPtrVA));
+    // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
+    if (*slot == nullptr) {
+        *slot = static_cast<void*>(g_keystate_buffer.data());
+        WFH_INFO("head", "M3.9: installed 256-byte stub keystate buffer (DAT_006785d8)");
+    }
+}
+
 // M3.4: replaces Render_SwitchActiveDriver. Installs the non-null no-op driver and
 // reports success; never calls the original (so Winsys_SelectBestUsableRenderer /
 // the "Hokey Display Card" error box never runs). Returns 1 (uint success), which
@@ -386,6 +485,14 @@ auto __cdecl Stub_Render_SwitchActiveDriver() -> unsigned {
     // NOLINTNEXTLINE(clang-analyzer-core.FixedAddressDereference)
     *driver_ptr = StubDriverObject();
     WFH_INFO("head", "M3.4: Render_SwitchActiveDriver short-circuited; no-op driver installed");
+    // M3.8: also populate the six viewport globals the stubbed
+    // Render_InitDriverAndViewports would have filled, so the unconditional
+    // Viewport_InitManager path does not NULL-deref.
+    InstallStubViewports();
+    // M3.9: ensure the keystate buffer is live here too. Render_SwitchActiveDriver
+    // runs unconditionally on the boot path (whereas the Winsys_Input_InitWin32State
+    // stub may be skipped), and the body loop's input poll dereferences it.
+    EnsureKeystateBuffer();
     return 1U;
 }
 
@@ -475,17 +582,18 @@ auto InstallRegistryGateBypass() -> bool {
     return true;
 }
 
-// TEMP (M3.7 diagnostic) — remove after diagnosis. Install the App_ExitGracefully
-// backtrace-logging detour. UNLIKE every other head stub, this one CALLS THROUGH,
-// so it passes the real trampoline slot (g_app_exit_gracefully_orig) to
-// InstallDetour. Returns true on success.
-auto InstallAppExitGracefullyDiag() -> bool {
+// M3.7: install the App_ExitGracefully boot-exit guard. UNLIKE every other head
+// stub, this one CALLS THROUGH for non-boot callers, so it passes the real
+// trampoline slot (g_app_exit_gracefully_orig) to InstallDetour. Returns true on
+// success.
+auto InstallAppExitGracefullyGuard() -> bool {
     if (!InstallDetour(TargetAt(addr::App_ExitGracefully), AsVoidPtr(&Stub_App_ExitGracefully),
                        &g_app_exit_gracefully_orig)) {
-        WFH_FATAL("diag", "M3.7: failed to install App_ExitGracefully diagnostic detour");
+        WFH_FATAL("head", "M3.7: failed to install App_ExitGracefully boot-exit guard");
         return false;
     }
-    WFH_INFO("diag", "M3.7 diagnostic detour installed: App_ExitGracefully (logs + calls through)");
+    WFH_INFO("head", "M3.7 boot-exit guard installed: App_ExitGracefully (skips boot exit, "
+                     "calls through for real shutdown)");
     return true;
 }
 
@@ -541,10 +649,9 @@ auto InstallHeadStubs() -> bool {
         return false;
     }
 
-    // TEMP (M3.7 diagnostic) — remove after diagnosis. Install the
-    // App_ExitGracefully backtrace logger so the boot-exit caller is captured.
-    // It only logs and calls through; it does NOT alter the exit behavior.
-    if (!InstallAppExitGracefullyDiag()) {
+    // M3.7: install the App_ExitGracefully boot-exit guard so the early browser-
+    // then-exit branch in Client_Main does not terminate the headless boot.
+    if (!InstallAppExitGracefullyGuard()) {
         return false;
     }
 
