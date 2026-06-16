@@ -7,6 +7,12 @@
 namespace wfh {
 
 // One expected byte signature at a known address (opening bytes of a hooked/called fn).
+// Field order is the fixed ABI the generated kSites[] table is emitted against
+// (name, address, bytes, length); we keep it stable rather than reorder for the
+// analyzer's preferred packing, so the tail padding on 64-bit builds is intentional.
+// This optin.performance.Padding diagnostic only fires now that the real manifest
+// instantiates HookSite objects (previously sites was always nullptr).
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct HookSite {
     const char* name;
     std::uint32_t address;      // absolute VA (image base 0x00400000)

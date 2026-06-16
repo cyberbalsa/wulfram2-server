@@ -11,6 +11,7 @@ constexpr std::uint32_t App_RunGameAndExit = 0x004a0b70;
 constexpr std::uint32_t Net_InitAccept = 0x00507ff0;
 constexpr std::uint32_t Net_InitMultiUdpIpAccept = 0x00507ee0;
 constexpr std::uint32_t Net_InitAcceptSocket = 0x00507810;
+constexpr std::uint32_t Render_SwitchActiveDriver = 0x00485f70;
 constexpr std::uint32_t Render_InitDriverAndViewports = 0x00485b20;
 constexpr std::uint32_t Winsys_D3D_Init = 0x004a8880;
 constexpr std::uint32_t Winsys_D3D_InitDevice = 0x004a8280;

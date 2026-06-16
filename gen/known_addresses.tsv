@@ -3,6 +3,7 @@ App_RunGameAndExit	0x004a0b70
 Net_InitAccept	0x00507ff0
 Net_InitMultiUdpIpAccept	0x00507ee0
 Net_InitAcceptSocket	0x00507810
+Render_SwitchActiveDriver	0x00485f70
 Render_InitDriverAndViewports	0x00485b20
 Winsys_D3D_Init	0x004a8880
 Winsys_D3D_InitDevice	0x004a8280

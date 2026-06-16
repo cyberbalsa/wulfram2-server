@@ -265,10 +265,17 @@ TEST(GeneratedHeaders, AddressesAndManifestAreSane) {
     static_assert(wfh::addr::Voice_InitSystem == 0x0048b680u, "address drift");
     // gen/binary_manifest.h: real wulfram2.exe identity. Image base is fixed.
     EXPECT_EQ(wfh::kBinaryManifest.image_base, 0x00400000u);
-    EXPECT_EQ(wfh::kBinaryManifest.site_count, 0u);
-    EXPECT_EQ(wfh::kBinaryManifest.sites, nullptr);
+    // Hook-site byte capture (--hook-bytes 16) emits one HookSite per hook_sites.txt
+    // entry; the table is non-null with exactly 13 captured sites.
+    EXPECT_EQ(wfh::kBinaryManifest.site_count, 13u);
+    EXPECT_NE(wfh::kBinaryManifest.sites, nullptr);
     EXPECT_NE(wfh::kBinaryManifest.time_date_stamp, 0u);
     EXPECT_NE(wfh::kBinaryManifest.size_of_image, 0u);
+    // Each captured site carries 16 real opening bytes at its fixed VA.
+    for (std::uint32_t i = 0; i < wfh::kBinaryManifest.site_count; ++i) {
+        EXPECT_EQ(wfh::kBinaryManifest.sites[i].length, 16u);     // NOLINT
+        EXPECT_NE(wfh::kBinaryManifest.sites[i].bytes, nullptr);  // NOLINT
+    }
 }
 
 TEST(PeValidate, HookSitesUnreadableAddressFailsSafe) {
