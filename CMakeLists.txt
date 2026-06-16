@@ -75,7 +75,8 @@ target_link_libraries(loader PRIVATE wfh_loader_core wfh_log)
 add_library(wulf_headless SHARED
     src/dll/dllmain.cpp
     src/dll/init.cpp
-    src/dll/hooks/engine_hooks.cpp)
+    src/dll/hooks/engine_hooks.cpp
+    src/dll/hooks/head_stubs.cpp)
 target_include_directories(wulf_headless PRIVATE include gen src/dll)
 target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe minhook dbghelp)
 

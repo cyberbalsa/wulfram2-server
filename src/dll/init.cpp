@@ -6,6 +6,7 @@
 #include "wfh/ready_event.hpp"
 
 #include "hooks/engine_hooks.hpp"
+#include "hooks/head_stubs.hpp"
 
 #include "binary_manifest.h"
 
@@ -23,6 +24,9 @@ namespace {
 
 // Exit code raised when the in-process binary self-check fails ('WF' in ASCII).
 constexpr UINT kSelfCheckFailedExitCode = 0x5746;
+
+// Exit code raised when head-stub detour installation fails ('WG' in ASCII).
+constexpr UINT kHeadStubsFailedExitCode = 0x5747;
 
 // Resolve the directory the loaded DLL lives in, from its module handle.
 auto DllDirectory(HMODULE module) -> std::filesystem::path {
@@ -71,6 +75,26 @@ void SignalReady() {
     CloseHandle(ev);
     WFH_INFO("init", "signaled ready");
 }
+
+// Stand up the hooking engine and install every head detour, BEFORE the loader
+// resumes the game thread, so all hooks are live before any seam can run. On
+// success returns 0; on failure logs and returns the process exit code to abort
+// with so the caller never signals ready (the loader then times out and tears
+// the process down rather than resuming a half-hooked game).
+auto SetUpHooks() -> UINT {
+    if (!HooksInit()) {
+        WFH_FATAL("init", "MinHook init failed -- aborting");
+        return kSelfCheckFailedExitCode;
+    }
+    WFH_INFO("init", "MinHook initialized");
+
+    if (!InstallHeadStubs()) {
+        WFH_FATAL("init", "head-stub install failed -- aborting");
+        return kHeadStubsFailedExitCode;
+    }
+    WFH_INFO("init", "head stubs installed");
+    return 0;
+}
 // NOLINTEND(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-avoid-do-while)
 
 }  // namespace
@@ -100,22 +124,19 @@ DWORD WINAPI InitThread(LPVOID module_handle) {
     }
     WFH_INFO("init", "hook-site self-check OK (%u sites)", kBinaryManifest.site_count);
 
-    // Stand up the hooking engine BEFORE we signal the loader. The head detours
-    // (Milestone 3.3) will be installed here too, via InstallDetour, so they are
-    // live before the loader resumes the game's main thread. For M3.2 there are
-    // no head detours yet, so this is just engine init.
-    if (!HooksInit()) {
-        WFH_FATAL("init", "MinHook init failed -- aborting");
+    // Stand up the hooking engine and install the 11 head detours BEFORE we signal
+    // the loader, so every hook is live before the game's main thread resumes. Any
+    // failure aborts WITHOUT signaling ready (see SetUpHooks / SignalReady).
+    if (const UINT hook_exit_code = SetUpHooks(); hook_exit_code != 0) {
         Log::Shutdown();
-        ExitProcess(kSelfCheckFailedExitCode);
+        ExitProcess(hook_exit_code);
     }
-    WFH_INFO("init", "MinHook initialized");
 
     // Ready handshake: now that hooks are live, tell the loader it may resume the
     // still-suspended game main thread (see SignalReady).
     SignalReady();
 
-    WFH_INFO("init", "foundation ready; head-chop deferred to Milestone 3");
+    WFH_INFO("init", "foundation ready; head seams stubbed");
     // NOLINTEND(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-avoid-do-while)
     return 0;
 }
