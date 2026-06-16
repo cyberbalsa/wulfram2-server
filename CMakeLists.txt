@@ -65,6 +65,14 @@ target_include_directories(wfh_log PUBLIC include)
 add_library(wfh_pe STATIC src/common/pe_validate.cpp)
 target_include_directories(wfh_pe PUBLIC include gen)
 
+# Wire-protocol codec: pure, engine-less, host-testable. The security boundary that
+# parses untrusted bytes (bit reader/writer, TCP/UDP framing, validators).
+add_library(wfh_proto STATIC
+    src/dll/server/proto/bitstream.cpp
+    src/dll/server/proto/framing.cpp
+    src/dll/server/proto/validate.cpp)
+target_include_directories(wfh_proto PUBLIC include)
+
 add_library(wfh_loader_core STATIC src/loader/injector.cpp src/loader/loader_args.cpp)
 target_include_directories(wfh_loader_core PUBLIC include gen)
 target_link_libraries(wfh_loader_core PUBLIC wfh_log wfh_pe)
@@ -78,13 +86,13 @@ add_library(wulf_headless SHARED
     src/dll/hooks/engine_hooks.cpp
     src/dll/hooks/head_stubs.cpp)
 target_include_directories(wulf_headless PRIVATE include gen src/dll)
-target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe minhook dbghelp)
+target_link_libraries(wulf_headless PRIVATE wfh_log wfh_pe wfh_proto minhook dbghelp)
 
-add_executable(wfh_tests tests/test_main.cpp)
-target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_loader_core GTest::gtest_main)
+add_executable(wfh_tests tests/test_main.cpp tests/test_proto.cpp)
+target_link_libraries(wfh_tests PRIVATE wfh_log wfh_pe wfh_proto wfh_loader_core GTest::gtest_main)
 gtest_discover_tests(wfh_tests)
 
-set(WFH_TARGETS wfh_log wfh_pe wfh_loader_core loader wulf_headless wfh_tests)
+set(WFH_TARGETS wfh_log wfh_pe wfh_proto wfh_loader_core loader wulf_headless wfh_tests)
 
 if(MSVC)
     foreach(target ${WFH_TARGETS})
