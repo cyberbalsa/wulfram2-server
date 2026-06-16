@@ -269,6 +269,37 @@ and a from-scratch sim is not:
   code/addr + breadcrumb (tick#, last cmd) + MiniDumpWriteDump (dbghelp linked), terminate cleanly.
   Untrusted client input crossing into the engine makes this mandatory.
 
+### M5.4 — World hosting: load a map + populate the world (engine-driven, no network) [VERIFIED CALLABLE]
+The full-world bring-up is directly callable in-process (the net handlers are thin parsers over plain
+functions). On the tick thread, after boot:
+1. `Game_ResetSession(0)` @ 0x419390 — clean session (sets local-player OID `DAT_005b83e0 = -1`; a
+   pure server leaves it -1 so nothing grabs the local camera via `Game_EnterWorldAsObject`).
+2. **`Client_SetCurrentWorld(worldType, "mapname", worldFlag, seed)` @ 0x4b9eb0** — loads
+   `./data/maps/<name>/land`, builds terrain quadtree + the spatial/collision tree. Internally:
+   `MapGrid_LoadByName` 0x4e6d10 → `Spatial_RebuildWorldVisibilityTree` 0x441370 →
+   `SpatialIndex_RebuildGlobal` 0x4e9030 → `SpatialRoot_InitFromMap` 0x4e8760. After this,
+   `DAT_006785e4` (world map) and `g_pWorldTraceRootNode` (collision/raycast tree, sized to map) are live.
+3. Per object (tank / base / missile / cargo): `Obj_Create(extra, isLocal=0, type, team, team, 0, 0)`
+   @ 0x419a70 — **OID in EBX** (verify the exact convention before calling); auto-inserts into
+   `OidTable_Construct`'d `DAT_00677f34`. Then `Obj_InitFromSpawn(x,y,z, oX,oY,oZ)` @ 0x419880 (entity
+   in EAX) — sets transform AND **auto-registers into the spatial index** (`SpatialIndex_InsertEntity`
+   0x4e8920), so it is immediately collidable + raycastable. No extra registration call needed.
+- Boot-time globals (`WorldState_InitGlobal` 0x4e77d0, `World_InitState` 0x417330,
+  `CollisionSystem_InitGlobals` 0x4e6fb0, `OidTable_Construct`) already run in `Client_Main` — done by
+  the current headless build. **BEHAVIOR 0x24 tunables are NOT needed for spawn/collision/raycast** —
+  only for correct movement integration (supply later, M6/M7).
+- **Interaction is free:** all hit/collision/proximity queries read the engine's own world via
+  `g_pWorldTraceRootNode`/`DAT_006785e4` — `WorldTrace_TraceTerrainAndEntities` 0x4f0c20,
+  `Weapon_FireProjectileTrace` 0x4f77f0, `SpatialIndex_ForEachEntityInRadius` 0x4e8220,
+  `Entity_CheckCollision` 0x4e73f0. Populate the world ⇒ tanks/missiles/bases interact natively.
+- **Hard prereq:** map files must exist at `./data/maps/<name>/` relative to the headless process CWD
+  (engine hard-codes `"./data/maps/"`; missing → `_exit`). Surface `..\Wulf-Forge\shared\data\maps\`
+  (or the client's `data\maps\`) as `./data/maps/`. Tick already calls `SpatialIndex_TickMaintenance`
+  when `g_pWorldTraceRootNode != 0`, keeping the index fresh as objects move.
+- Verify: load a map headless (no crash), spawn N objects, confirm they appear in `DAT_006785e4`
+  and that an `Entity_CheckCollision`/`WorldTrace_*` query sees them; this is the world the relay
+  (M6.1) replicates and the action ingest (M5.2) drives.
+
 ---
 
 ## Risks / notes
