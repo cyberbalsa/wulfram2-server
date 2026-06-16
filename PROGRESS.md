@@ -45,9 +45,20 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
       gtest static-asserts the headers. Commit `20d1448`. 11/11 ctest.
 - [x] **Task 6** — ABI binding typedefs (`Cdecl`/`Stdcall`/`Thiscall` by absolute address). `__thiscall`
       confirmed clean under `/permissive- /WX`. Commit `ea69f8c`. 13/13 ctest.
-- [ ] **Task 7** — DllMain + InitThread
-- [ ] **Task 8** — Config + log level wiring
-- [ ] **Task 9** — Integration smoke test
+- [x] **Task 7+8** (merged) — minimal `DllMain` (loader-lock-safe) → `InitThread` (binary self-check +
+      config-driven log level via header-only `ParseLogLevel`, unit-tested). Commit `71d9658`. 14/14 ctest.
+      Codex review dispatched but stalled; **loader-lock safety validated empirically by the Task 9 smoke**.
+  (Task 8 config/log-level wiring folded into Task 7+8 above.)
+- [x] **Task 9** — Integration smoke (injected into real `./w2/wulfram2.exe`): pinning OK (stamp match) →
+      suspended launch (pid) → injected → **InitThread markers logged inside the live process** (<0.5s, no
+      loader-lock deadlock); wrong binary rejected (exit 1, no spawn); process cleaned up. Notes: `docs/superpowers/notes/2026-06-16-m0-m2-smoke.md`. Commit `02d9097`.
+
+### ✅ Milestone 0–2 COMPLETE (2026-06-16)
+Foundation done: 32-bit CMake/MinHook build, zero-warning quality gate (clang-tidy + cppcheck + git hooks),
+async logging, suspended-inject loader with PE binary-pinning + TOCTOU lock, address/manifest generation from
+the real binary, ABI typedefs, and a minimal DllMain→InitThread that runs in the live game process. Codex-reviewed
+the security-critical paths (PE validator, injector). Next: **Milestone 3 — head-chop** (stub the 12 `*_Init`
+seams, capture real hook-site bytes, prove headless boot to the loop seam).
 - Deferred to follow-on plans: **M3** head chop, **M4** loop hijack + fixed timestep + SEH,
   **M5** Net object + sessions, **M6** physics drive, **M7** multi-client + game rules.
 
