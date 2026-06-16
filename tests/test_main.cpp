@@ -39,11 +39,32 @@ void test_log_writes_to_file_and_respects_level() {
     Expect(contents.find("net") != std::string::npos, "category missing");
 }
 
+void test_log_double_init_is_safe() {
+    const auto dir = std::filesystem::temp_directory_path() / "wfh_log_double_init_test";
+    std::filesystem::remove_all(dir);
+    const auto file = dir / "headless.log";
+
+    wfh::Log::Init(file, wfh::Level::Info);   // first init starts the worker
+    wfh::Log::Init(file, wfh::Level::Info);   // second init must be a no-op (idempotent)
+    WFH_LOG(wfh::Level::Warn, "net", "double_init_marker");
+    wfh::Log::Shutdown();                     // flushes synchronously
+
+    const std::string contents = ReadAll(file);
+    const std::string marker = "double_init_marker";
+    std::size_t count = 0;
+    for (std::size_t pos = contents.find(marker); pos != std::string::npos;
+         pos = contents.find(marker, pos + marker.size())) {
+        ++count;
+    }
+    Expect(count == 1, "double_init_marker should appear exactly once");
+}
+
 int main() {
     int failures = 0;
     struct Case { const char* name; void(*fn)(); };
     const Case cases[] = {
         {"log_writes_to_file_and_respects_level", test_log_writes_to_file_and_respects_level},
+        {"log_double_init_is_safe", test_log_double_init_is_safe},
     };
     for (const auto& c : cases) {
         try { c.fn(); std::cout << "  ok   " << c.name << "\n"; }

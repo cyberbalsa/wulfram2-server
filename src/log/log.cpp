@@ -34,11 +34,21 @@ struct State {
     std::ofstream file;
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::string> queue;
+    std::deque<std::string> queue;  // NOTE: queue is unbounded; backpressure/cap deferred to the tick-loop milestone (M4).
     std::thread worker;
     std::atomic<bool> running{false};
     std::atomic<int> min_level{static_cast<int>(Level::Debug)};
     std::atomic<std::uint64_t> tick{0};
+
+    // Safe teardown if Shutdown() was never called (e.g. injected-DLL path that
+    // runs for the whole process lifetime). Destroying a still-joinable
+    // std::thread triggers std::terminate(); stop the worker first. Cooperates
+    // with Shutdown(): if Shutdown already ran, worker is no longer joinable.
+    ~State() {
+        running.store(false);
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
 };
 
 State& S() { static State s; return s; }
@@ -73,6 +83,7 @@ void WorkerMain() {
 
 void Log::Init(const std::filesystem::path& file, Level min_level) {
     State& s = S();
+    if (s.running.load()) return;  // idempotent: a worker is already running
     std::filesystem::create_directories(file.parent_path());
     s.file.open(file, std::ios::app);
     s.min_level.store(static_cast<int>(min_level));
