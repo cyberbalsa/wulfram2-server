@@ -69,6 +69,94 @@ our render-free, paced server tick; `DAT_00677f1d` kept 0 so it runs forever).
 
 ---
 
+## M5.0 wire-protocol findings (cross-validated vs the WORKING Python server)
+
+The retired `..\Wulf-Forge` Python server is a **proven reference** — it got real clients
+in-game. Its protocol is now cross-referenced to the binary. What was "bad" in Python was
+the PHYSICS (`wulfsim` re-derives float math → drift), NOT the protocol/handshake. So the
+protocol is a solved problem we can port with confidence.
+
+### CORRECTION (important): `DAT_00677f1d` is NOT the join gate
+It is the **version-MISMATCH error flag**, set to 1 only on FAILURE (HELLO sub-0 when
+`version != 0x4E89`, and `Net_HandleVersionError`). A matching version leaves it 0. The
+real "client joined" markers the client sets ITSELF are `DAT_00679080` (HELLO complete) and
+`DAT_00678267` (UDP identified). Server job: don't trip the mismatch + complete the key/UDP
+round-trip. (Note: M4.1's spoof set this error flag — fine as an exit/seam test, irrelevant
+to real sessions.)
+
+### Transport + framing (confirmed both sides)
+- TCP = reliable control: `[u16_be length(incl 2)][opcode byte][MSB-first bitpacked body]`
+  (`Net_FinalizeAndSendPacket` 0x509bc0 htons; opcode via `Net_BeginSendReliablePacket` 0x509c90).
+- UDP = gameplay/unreliable: 2-byte seq word + opcode (`Net_BeginSendUnreliablePacket` 0x509b60).
+- fixed 16.16 = `WriteInt32(round(v*65536))`. String = `[u16 len-incl-NUL][ASCII+NUL]`.
+- Port is server-list-driven (no binary constant); Python used 2627 TCP+UDP.
+
+### HELLO = opcode 0x13, subtype-multiplexed
+sub-0 VERSION_CHECK (int32, MUST be `0x4E89`=20105), sub-1 UDP_CONFIG (u16 port,u16 count,
+count×string host), sub-2 SESSION_KEY (string; client echoes on UDP), sub-3 VERIFIED.
+
+### Ordered server→client bring-up (from the working `do_login_and_bootstrap`)
+0x13/1 UDP_CONFIG → 0x13/0 VERSION(0x4E89) → 0x13/2 SESSION_KEY → (client echoes key on UDP)
+→ 0x4D IDENTIFIED_UDP → (client LOGIN 0x21 user) → 0x22 LoginStatus(1=ask pw) → (LOGIN 0x21 pw)
+→ 0x13/3 VERIFIED → 0x28 TEAM_INFO → 0x22 LoginStatus(8=ok) → 0x17 PLAYER(assign id) →
+0x2F GAME_CLOCK → 0x23 MOTD → **0x24 BEHAVIOR (physics tunables — positional field counts
+Tank7/Scout9/Bomber11, no framing; wrong count desyncs)** → 0x32 TRANSLATION (quant table;
+client ACKs 0x33) → 0x1A ADD_TO_ROSTER(self+others) → 0x16 WORLD_STATS(map) → map entities.
+Then client sends 0x39 WANT_UPDATES → server sends 0x0F snapshot. In-game control: client
+0x25 REINCARNATE (UDP) → server 0x18 TANK spawn (net_id) + 0x25 REINCARNATE(0) + 0x1E
+BIRTH_NOTICE; per-tick 0x0F (self) / 0x0E (others) carry motion.
+
+### Gotchas
+- Version equality (`0x4E89`) is the ONLY hard gate. No encryption/checksums; session key is a
+  trust-the-echo round trip. BEHAVIOR(0x24) field counts are positional. TRANSLATION(0x32) must
+  precede movement decode. UDP↔TCP linkage = correlate the UDP source by the echoed key.
+
+### Two ways to be the server (DECISION NEEDED — see below)
+- **(A) In-binary accept bridge:** `Net_InitAccept` 0x507ff0 + `Net_FindOrCreatePeer` + reuse the
+  engine's own send/recv. Maximal reuse of engine framing, but the resident handler table is the
+  CLIENT set; we'd register/drive server-side handling.
+- **(B) Independent socket server in the DLL** that speaks the (now-known, proven) framing
+  directly (port the Python protocol to C++), and uses the in-process engine purely as the
+  **bit-perfect physics oracle** (feed inputs → run engine tick → read entity structs → emit
+  state). Cleanest separation; the protocol is already proven in Python.
+- **(C) Inject inbound packets into the client receive path** via `Proto_DispatchPacket` 0x509f70.
+
+## M5.0 entity data contract (verified — struct 0x170, world list, codec)
+
+World list: `*DAT_006785e4` → WorldMap; `(*DAT_006785e4)+0` = Util_List (count@+0,head@+4,tail@+8);
+nodes 0xc bytes (next@+0,prev@+4,entity@+8). RunWorldTick walks `*(param_1+4)`. By-id:
+`OidTable_Find(DAT_00677f34, oid)` 0x4e34f0.
+
+Entity struct (offset → field), all verified:
+- +0x08 unit_type; +0x0C/10/14 **pos** (float); +0x18/1C/20 **velocity** (engine-produced);
+  +0x24/28/2C linear-accel accumulator (**zeroed every tick**); +0x30/34/38 **orientation EULER**;
+  +0x3C/40/44 **spin** (angular vel); +0x48/4C/50 angular-accel accumulator (**zeroed every tick**);
+  +0x58..0x9F cached transform matrix/scale; +0xA0..A8 prev-euler cache; +0xAD at-rest, +0xAE sleep;
+  +0xB0 target id; +0xB4 **OID** (init 0xffffffff); +0xB8 active flag; +0xBC EntityPhysics obj (0xc8);
+  +0xC0 physics-descriptor (mode flag bytes); +0xCC owner; +0xD0 **health (absolute)**;
+  +0xD4 **energy/fuel (absolute)**; +0xD8 weapon/turret array; +0xE8 spatial node; +0xEC team; +0xF0 owner2.
+- Create: `Obj_Create` 0x419b62 (oid in EBX) → `Obj_InitFromSpawn` 0x4198d3 (pos/rot + world-list push).
+  Destroy: `Obj_DestroyById` 0x419319 (oid in EDI). Move: write +0x0C/+0x30 then wake (+0xAE=0 /
+  `EntityPhysics_WakeAndSnapshot`).
+- UPDATE_ARRAY codec (ground truth = decoder `Net_ApplyWorldSnapshot` 0x47d828): per unit `ReadInt(oid)`,
+  `ReadBits(1,hasEvent)`, `ReadBits(10,mask)`, defIndex. Mask bits: 0=DEF(type/team/owner) 1=POS 2=VEL
+  3=ROT 4=SPIN 5=HEALTH 6=WEAPON 7=ENERGY 8=TARGET 9=HARD_SYNC. Vec3 via `Net_DecodeColorTriple` 0x47cfa0
+  + `Range_LevelToValue` 0x4f8f40 against the **server-sent TRANSLATION_TABLE** at `DAT_00678134`
+  (`Net_HandleTranslationTable` 0x46e9ac), entries 0x40 bytes.
+
+## Why the Python server's gamestate was "bad" — and why our design avoids it by construction
+These 5 are the reimplementation traps the bit-perfect (engine-runs-the-math) design SIDESTEPS:
+1. Orientation is **euler vec3 @ +0x30**, not quaternion/matrix. (We read the engine's euler directly.)
+2. Wire **velocity/spin do NOT write +0x18/+0x3C** — they seed the interpolator; live velocity is the
+   engine integrator's output. (We never write wire-vel into the entity; the engine produces it.)
+3. Accumulators **+0x24/+0x48 are zeroed every tick** — transient force/torque, not state. (Engine owns them.)
+4. Quantization is **server-driven (TRANSLATION_TABLE)**, not constant — hardcoded quant = subtly-wrong
+   pos/health/fuel = the "gamestate bad" symptom. (We capture/emit the engine's own table + codec.)
+5. Health/fuel are **absolute (level × maxStat)** at +0xD0/+0xD4; wire carries a level index through
+   `Range_LevelToValue`. (We read absolute from the struct and emit via the engine's encoder.)
+
+---
+
 ## Tasks
 
 ### M5.0 — RE: finalize the entity physics-field offsets + the inbound action-apply path (READ-ONLY)
