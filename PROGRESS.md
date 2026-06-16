@@ -43,7 +43,8 @@ and reusing the binary's own physics + `Net_*` code. Spec and plan live under `d
 - [x] **Task 5** — `gen_addresses.py` + pytest; generated `addresses.h` (17 consts) + `binary_manifest.h`
       with real `wulfram2.exe` stamps (stamp `0x45254d1f`, size `0x288000`, sum `0x1c45a4`, base `0x400000`).
       gtest static-asserts the headers. Commit `20d1448`. 11/11 ctest.
-- [ ] **Task 6** — ABI binding typedefs
+- [x] **Task 6** — ABI binding typedefs (`Cdecl`/`Stdcall`/`Thiscall` by absolute address). `__thiscall`
+      confirmed clean under `/permissive- /WX`. Commit `ea69f8c`. 13/13 ctest.
 - [ ] **Task 7** — DllMain + InitThread
 - [ ] **Task 8** — Config + log level wiring
 - [ ] **Task 9** — Integration smoke test
