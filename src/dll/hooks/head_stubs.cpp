@@ -314,61 +314,49 @@ auto __cdecl Stub_App_ExitGracefully(int param_1, int param_2) -> void {
 // calling the original (the real loop drives the present path). M4 replaces the
 // loop body with the real headless server tick.
 auto __cdecl Stub_Client_RunMainLoop_Observe() -> void {
-    WFH_INFO("boot", "reached Client_RunMainLoop — head-chop OK");
+    // Tripwire: with M4.2 (DAT_00677f1d kept 0) the inline loop is the server tick
+    // and this terminal path should NOT be reached. Log loudly if it is.
+    WFH_WARN("boot", "reached Client_RunMainLoop (terminal path) — connect/exit gate was set");
 }
 
 // ---------------------------------------------------------------------------
-// M4.1 connect-gate spoof.
+// M4.2 headless server tick: neuter rendering, run the inline loop forever.
 //
-// Client_Main's front-end loop only advances into the real game loop
-// (App_RunGameAndExit @ 0x004a0b70 -> Client_RunMainLoop @ 0x004a0aa0) when the
-// byte gate DAT_00677f1d != 0, which is read at 0x00418f9d. Natively that gate is
-// set only by the network HELLO handshake (Net_HandleHello @ 0x0046d020 sets it on
-// a version packet; Net_HandleVersionError sets it unconditionally). wulfram2.exe
-// has NO in-binary dedicated server (Net_InitAccept* serve only the DbgNet debug
-// port 6969), so there is nothing to loopback-connect to in-process. We therefore
-// SPOOF "connected" by setting the gate ourselves at a safe point.
+// The PERSISTENT per-frame tick is Client_Main's own inline do/while(true) loop
+// (0x00418c61..0x00419000). Every iteration it already pumps networking
+// (Net_ServiceConnection @ 0x0046b830, Net_TickEntityHoldList, Net_TickReliableTimeout,
+// Net_FlushActionUpdates), the timer/frame-delta, sim/anim/interp/fx, and the OS
+// window message pump (*DAT_006780b0) — i.e. it IS the server tick. The ONLY
+// process-exit from that loop is `if (DAT_00677f1d != 0) { App_RunGameAndExit();
+// App_ExitGracefully(0,0); }` at 0x00418f9d. So for an indefinitely-running server
+// we must KEEP DAT_00677f1d == 0 (do NOT spoof it — that diverts to the terminal
+// App_RunGameAndExit -> Client_RunMainLoop path which exits after one run).
 //
-// Safe point: DbgNet_Init @ 0x004139e0 runs once near the END of Client_Main's
-// init (after world/sim/collision/UI are all constructed), immediately before the
-// front-end loop. We detour it to call through (real debug-net init) and THEN set
-// the gate, so the first loop iteration takes the App_RunGameAndExit path.
+// The only client-specific work in the loop is the render branch at 0x00418f6d:
+//   if (DAT_005b83f4 != 0) Client_RenderFrame(); else Util_SleepMillis(100);
+// Client_RenderFrame @ 0x004281a0 (void __stdcall) is PURE DRAW (driver sync,
+// present vtable, HUD/scoreboard, flip) with no sim/net side effects — all of which
+// already ran earlier in the iteration. We detour it to a no-op so nothing renders.
 //
-// App_RunGameAndExit splits two version globals (DAT_005dd67c server, DAT_005dd674
-// client) for the version display; Net_HandleHello normally fills them. We seed
-// both with the client version (0x4e89 = 20105) so that math is sane.
+// Pacing: DAT_005b83f4 is set by the window proc, so when our hidden window is
+// "active" the loop would take the render branch and, with render no-op'd, spin at
+// 100% CPU. So the no-op detour also Sleeps to pace the tick (matching the engine's
+// native ~10Hz idle), avoiding a busy-loop regardless of DAT_005b83f4.
 //
-// ABI: void __cdecl DbgNet_Init(void) — confirmed in Ghidra. Detour matches it, so
-// the trampoline call-through is ABI-correct.
+// ABI: void __stdcall Client_RenderFrame(void) — confirmed in Ghidra. The detour
+// matches it (zero stack args), so an empty body balances the stack.
 
-// VAs pinned here (gen/addresses.h holds functions only).
-constexpr std::uint32_t kDbgNetInitVA = 0x004139e0;
-constexpr std::uint32_t kConnectGateVA = 0x00677f1d;    // DAT_00677f1d
-constexpr std::uint32_t kServerVersionVA = 0x005dd67c;  // DAT_005dd67c
-constexpr std::uint32_t kClientVersionVA = 0x005dd674;  // DAT_005dd674
-constexpr std::int32_t kClientVersion = 0x4e89;         // 20105
+// VA pinned here (gen/addresses.h holds functions only).
+constexpr std::uint32_t kClientRenderFrameVA = 0x004281a0;
 
-// Trampoline slot for the real DbgNet_Init (filled by InstallDetour).
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-void* g_dbgnet_init_orig = nullptr;
+// Per-tick pacing when render is neutered (ms). Matches the engine's native idle
+// Util_SleepMillis(100) cadence (~10 Hz). M5 can lower this for a faster server tick.
+constexpr DWORD kServerTickPaceMs = 100;
 
-auto __cdecl Stub_DbgNet_Init() -> void {
-    // Run the real debug-net init first so its state is fully constructed.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    auto* const orig = reinterpret_cast<void(__cdecl*)()>(g_dbgnet_init_orig);
-    orig();
-
-    // Seed the version globals App_RunGameAndExit reads, then flip the connect gate
-    // so Client_Main enters App_RunGameAndExit -> Client_RunMainLoop on the next
-    // loop iteration. (No real server exists to send HELLO; this is the spoof.)
-    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
-    *static_cast<volatile std::int32_t*>(TargetAt(kServerVersionVA)) = kClientVersion;
-    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
-    *static_cast<volatile std::int32_t*>(TargetAt(kClientVersionVA)) = kClientVersion;
-    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
-    *static_cast<volatile std::uint8_t*>(TargetAt(kConnectGateVA)) = 1;
-    WFH_INFO("boot", "M4.1: connect gate spoofed (DAT_00677f1d=1) after DbgNet_Init — "
-                     "Client_Main will enter Client_RunMainLoop");
+auto WINAPI Stub_Client_RenderFrame() -> void {
+    // No rendering on a headless server. Pace the tick so the inline loop does not
+    // busy-spin when the window proc has set the render gate.
+    Sleep(kServerTickPaceMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,23 +404,28 @@ auto InstallAppExitGracefullyGuard() -> bool {
     return true;
 }
 
-// M4.1: install the connect-gate spoof (DbgNet_Init detour). Calls through, so it
-// passes the real trampoline slot (g_dbgnet_init_orig) to InstallDetour. Returns
-// true on success.
-auto InstallConnectGateSpoof() -> bool {
-    if (!InstallDetour(TargetAt(kDbgNetInitVA), AsVoidPtr(&Stub_DbgNet_Init),
-                       &g_dbgnet_init_orig)) {
-        WFH_FATAL("head", "M4.1: failed to install DbgNet_Init connect-gate spoof");
+// M4.2: install the headless server tick — neuter Client_RenderFrame. The detour
+// never calls through (no rendering), so the trampoline is discarded. Returns true
+// on success.
+auto InstallServerTick() -> bool {
+    void* original = nullptr;
+    if (!InstallDetour(TargetAt(kClientRenderFrameVA), AsVoidPtr(&Stub_Client_RenderFrame),
+                       &original)) {
+        WFH_FATAL("head", "M4.2: failed to install Client_RenderFrame no-op (server tick)");
         return false;
     }
     WFH_INFO("head",
-             "M4.1 connect-gate spoof installed: DbgNet_Init (sets DAT_00677f1d after init)");
+             "M4.2 server tick installed: Client_RenderFrame neutered "
+             "(inline loop runs headless, paced %lums)",
+             static_cast<unsigned long>(kServerTickPaceMs));
     return true;
 }
 
-// TEMP (M3): observation-only; M4 replaces the loop body. Install the
-// Client_RunMainLoop observation detour. The detour never calls through, so the
-// trampoline is discarded. Returns true on success.
+// Observation detour for Client_RunMainLoop @ 0x4a0aa0. NOTE: with the headless
+// server design (M4.2) we keep DAT_00677f1d == 0, so Client_Main's inline loop runs
+// forever and this terminal path is NOT taken. Kept as a tripwire: if it ever fires,
+// something set the connect/exit gate. The detour never calls through. Returns true
+// on success.
 auto InstallLoopObservationDetour() -> bool {
     void* original = nullptr;
     if (!InstallDetour(TargetAt(addr::Client_RunMainLoop),
@@ -470,15 +463,16 @@ auto InstallHeadStubs() -> bool {
         return false;
     }
 
-    // M4.1: spoof the network connect gate (DAT_00677f1d) from a DbgNet_Init detour,
-    // so Client_Main advances from the front-end into Client_RunMainLoop without a
-    // real server (there is no in-binary server to loopback-connect to).
-    if (!InstallConnectGateSpoof()) {
+    // M4.2: neuter Client_RenderFrame so Client_Main's inline loop runs as a headless
+    // server tick (net/sim/anim/timing every iteration, no rendering, paced). We keep
+    // DAT_00677f1d == 0 so that loop runs indefinitely (we do NOT spoof the connect
+    // gate, which would divert to the terminal App_RunGameAndExit -> exit path).
+    if (!InstallServerTick()) {
         return false;
     }
 
-    // TEMP (M3): observation-only; the M4 server-tick hijack point. Live before the
-    // loader resumes the game thread.
+    // Tripwire on the terminal Client_RunMainLoop path (should not fire under M4.2).
+    // Live before the loader resumes the game thread.
     return InstallLoopObservationDetour();
 }
 
