@@ -318,6 +318,60 @@ auto __cdecl Stub_Client_RunMainLoop_Observe() -> void {
 }
 
 // ---------------------------------------------------------------------------
+// M4.1 connect-gate spoof.
+//
+// Client_Main's front-end loop only advances into the real game loop
+// (App_RunGameAndExit @ 0x004a0b70 -> Client_RunMainLoop @ 0x004a0aa0) when the
+// byte gate DAT_00677f1d != 0, which is read at 0x00418f9d. Natively that gate is
+// set only by the network HELLO handshake (Net_HandleHello @ 0x0046d020 sets it on
+// a version packet; Net_HandleVersionError sets it unconditionally). wulfram2.exe
+// has NO in-binary dedicated server (Net_InitAccept* serve only the DbgNet debug
+// port 6969), so there is nothing to loopback-connect to in-process. We therefore
+// SPOOF "connected" by setting the gate ourselves at a safe point.
+//
+// Safe point: DbgNet_Init @ 0x004139e0 runs once near the END of Client_Main's
+// init (after world/sim/collision/UI are all constructed), immediately before the
+// front-end loop. We detour it to call through (real debug-net init) and THEN set
+// the gate, so the first loop iteration takes the App_RunGameAndExit path.
+//
+// App_RunGameAndExit splits two version globals (DAT_005dd67c server, DAT_005dd674
+// client) for the version display; Net_HandleHello normally fills them. We seed
+// both with the client version (0x4e89 = 20105) so that math is sane.
+//
+// ABI: void __cdecl DbgNet_Init(void) — confirmed in Ghidra. Detour matches it, so
+// the trampoline call-through is ABI-correct.
+
+// VAs pinned here (gen/addresses.h holds functions only).
+constexpr std::uint32_t kDbgNetInitVA = 0x004139e0;
+constexpr std::uint32_t kConnectGateVA = 0x00677f1d;    // DAT_00677f1d
+constexpr std::uint32_t kServerVersionVA = 0x005dd67c;  // DAT_005dd67c
+constexpr std::uint32_t kClientVersionVA = 0x005dd674;  // DAT_005dd674
+constexpr std::int32_t kClientVersion = 0x4e89;         // 20105
+
+// Trampoline slot for the real DbgNet_Init (filled by InstallDetour).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+void* g_dbgnet_init_orig = nullptr;
+
+auto __cdecl Stub_DbgNet_Init() -> void {
+    // Run the real debug-net init first so its state is fully constructed.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto* const orig = reinterpret_cast<void(__cdecl*)()>(g_dbgnet_init_orig);
+    orig();
+
+    // Seed the version globals App_RunGameAndExit reads, then flip the connect gate
+    // so Client_Main enters App_RunGameAndExit -> Client_RunMainLoop on the next
+    // loop iteration. (No real server exists to send HELLO; this is the spoof.)
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
+    *static_cast<volatile std::int32_t*>(TargetAt(kServerVersionVA)) = kClientVersion;
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
+    *static_cast<volatile std::int32_t*>(TargetAt(kClientVersionVA)) = kClientVersion;
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
+    *static_cast<volatile std::uint8_t*>(TargetAt(kConnectGateVA)) = 1;
+    WFH_INFO("boot", "M4.1: connect gate spoofed (DAT_00677f1d=1) after DbgNet_Init — "
+                     "Client_Main will enter Client_RunMainLoop");
+}
+
+// ---------------------------------------------------------------------------
 // Install helpers.
 
 // Install the registry-gate + browser bypass detours. The detours never call
@@ -362,6 +416,20 @@ auto InstallAppExitGracefullyGuard() -> bool {
     return true;
 }
 
+// M4.1: install the connect-gate spoof (DbgNet_Init detour). Calls through, so it
+// passes the real trampoline slot (g_dbgnet_init_orig) to InstallDetour. Returns
+// true on success.
+auto InstallConnectGateSpoof() -> bool {
+    if (!InstallDetour(TargetAt(kDbgNetInitVA), AsVoidPtr(&Stub_DbgNet_Init),
+                       &g_dbgnet_init_orig)) {
+        WFH_FATAL("head", "M4.1: failed to install DbgNet_Init connect-gate spoof");
+        return false;
+    }
+    WFH_INFO("head",
+             "M4.1 connect-gate spoof installed: DbgNet_Init (sets DAT_00677f1d after init)");
+    return true;
+}
+
 // TEMP (M3): observation-only; M4 replaces the loop body. Install the
 // Client_RunMainLoop observation detour. The detour never calls through, so the
 // trampoline is discarded. Returns true on success.
@@ -399,6 +467,13 @@ auto InstallHeadStubs() -> bool {
     // M3.7: skip ONLY the early "open website then quit" App_ExitGracefully so the
     // boot continues; real shutdown still calls through.
     if (!InstallAppExitGracefullyGuard()) {
+        return false;
+    }
+
+    // M4.1: spoof the network connect gate (DAT_00677f1d) from a DbgNet_Init detour,
+    // so Client_Main advances from the front-end into Client_RunMainLoop without a
+    // real server (there is no in-binary server to loopback-connect to).
+    if (!InstallConnectGateSpoof()) {
         return false;
     }
 
