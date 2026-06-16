@@ -1,5 +1,6 @@
 #include "wfh/injector.hpp"
 #include "wfh/log.hpp"
+#include "wfh/pe_validate.hpp"
 
 #include <gtest/gtest.h>
 
@@ -73,4 +74,27 @@ TEST(LoaderArgs, RequiresExe) {
     std::vector<std::wstring> argv = {L"loader.exe"};
     const auto r = wfh::ParseLoaderArgs(argv);
     EXPECT_FALSE(r.ok);
+}
+
+TEST(PeValidate, ValidateHeadersMatchAndMismatch) {
+    wfh::PeHeaderFacts facts;
+    facts.time_date_stamp = 0x12345678;
+    facts.size_of_image = 0x00300000;
+    facts.check_sum = 0x000ABCDE;
+    facts.image_base = 0x00400000;
+    wfh::BinaryManifest good{0x12345678, 0x00300000, 0x000ABCDE, 0x00400000, nullptr, 0};
+    EXPECT_TRUE(wfh::ValidateHeaders(facts, good).ok);
+    wfh::BinaryManifest bad = good;
+    bad.time_date_stamp = 0xDEADBEEF;
+    const auto r = wfh::ValidateHeaders(facts, bad);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("TimeDateStamp"), std::string::npos);
+}
+
+TEST(PeValidate, CompareBytesMatchAndMismatch) {
+    const std::uint8_t mem[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC};
+    const std::uint8_t expect_ok[] = {0x55, 0x8B, 0xEC};
+    const std::uint8_t expect_bad[] = {0x55, 0x90, 0xEC};
+    EXPECT_TRUE(wfh::CompareBytes(mem, expect_ok, 3).ok);
+    EXPECT_FALSE(wfh::CompareBytes(mem, expect_bad, 3).ok);
 }
