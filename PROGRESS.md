@@ -384,6 +384,23 @@ CTest**, `lint.ps1` = **PASS**.
   (`0x0A`/`0x09`) drives each tank from its player. Known refinement unchanged: altitude-hold while
   driving (tanks drift slowly in z; full off-map travel still descends).
 
+### ✅ M6.3 — in-game UDP `0x0E`/`0x0F` delta relay shipped (`3dc283c`, 2026-06-17)
+Closed the relay gap identified just below. Spawned sessions now receive, **per tick over UDP**,
+`UPDATE_ARRAY 0x0E` (the OTHER dynamic tanks) + `VIEW_UPDATE 0x0F` (self). `0x0F` leads with an i32
+**ms-timestamp** (steady_clock) then the i32 sequence; `0x0E` writes only the sequence; the rest is
+identical (stats block + u8 count + entity array). Each entity is sent with the full **DEFINITION** mask
+the first time a session sees it (tracked per-session in `SessionState.introduced`), then **`POS|ROT`-only
+deltas** so the client interpolates between updates instead of snapping. Pre-spawn sessions are unchanged
+(reliable full-world `0x0F` over TCP so team-select / pad-pick still works). UDP framing is bare
+`[opcode][bits]` (`BuildUpdateArray`), not the TCP length-prefixed `Frame()`. `WriteEntity` is now
+mask-parameterized. Tests rewritten to assert the UDP `0x0E`/`0x0F` behavior.
+**Verification:** build `/W4 /WX` clean, lint PASS, **109/109 CTest**, and a server boot-smoke (world
+`bpass` loaded, 3 demo tanks driven + moving, relay armed, ~400 ticks, **no errors/faults**).
+**Still pending one human check:** two rendering clients confirming smooth interpolation + no
+protocol-mismatch (can't be self-verified headless). **Next = M6.4 input routing:** decode inbound client
+`ACTION 0x09/0x0A` → drive that session's engine tank, else player tanks stay frozen server-side and peers
+see each other stuck at spawn (only the 3 demo tanks move). Captures: `tools/captures/action_packets_2026-06-17.txt`.
+
 ### ⟳ M6.2/M6.3 — live two-client test session + the real-time relay gap (2026-06-17)
 Ran a real **server + two rendering clients** end-to-end. Findings + fixes (all committed):
 - **Spectate crash root-caused + fixed (`7ebeae7`).** On reincarnate the server sent a TankSpawn for
