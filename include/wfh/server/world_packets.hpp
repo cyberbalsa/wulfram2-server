@@ -83,6 +83,13 @@ public:
         std::int32_t team, const std::array<float, 3>& pos, const std::array<float, 3>& rot)>;
     void SetSpawnHandler(SpawnHandler handler);
 
+    // Routes a decoded control-channel value to the engine entity that owns it. The bridge maps the
+    // originating session to its spawned engine oid (session.entity.net_id) -- the client never
+    // asserts which entity it drives. When set (world_host mode), the engine glue records the value
+    // for the per-tank drive (M6.4). Invoked on the tick thread from HandleCommand(ActionInput).
+    using InputHandler = std::function<void(std::int32_t oid, std::int32_t channel, float value)>;
+    void SetInputHandler(InputHandler handler);
+
 private:
     struct SessionState {
         std::uint64_t session_id = 0;
@@ -102,6 +109,7 @@ private:
     void RemoveSession(std::uint64_t session_id, bool& visibility_changed);
     void HandleReincarnate(const ClientCommand& cmd, bool& visibility_changed,
                            std::uint32_t sequence);
+    void HandleActionInput(const ClientCommand& cmd);
     void HandleTeamSwitch(SessionState& session, std::int32_t team);
     void SpawnOnPad(SessionState& session, const MvpEntitySnapshot& pad, std::uint32_t sequence,
                     bool& visibility_changed);
@@ -123,6 +131,7 @@ private:
     std::int32_t next_entity_id_ = 1;
     WorldProvider world_provider_;  // when set, supplies the authoritative world (M6.1)
     SpawnHandler spawn_handler_;    // when set (world_host), spawns the player's real engine tank
+    InputHandler input_handler_;  // when set (world_host), records decoded input for the tank drive
 };
 
 // The process-lifetime MVP bridge (also the M6.1 relay once a world provider is set).

@@ -723,6 +723,10 @@ void MvpOnlineBridge::SetSpawnHandler(SpawnHandler handler) {
     spawn_handler_ = std::move(handler);
 }
 
+void MvpOnlineBridge::SetInputHandler(InputHandler handler) {
+    input_handler_ = std::move(handler);
+}
+
 void MvpOnlineBridge::Tick(std::uint32_t sequence) {
     bool visibility_changed = false;
     for (const ClientCommand& cmd : inbound_->DrainAll()) {
@@ -748,10 +752,22 @@ void MvpOnlineBridge::HandleCommand(const ClientCommand& cmd, bool& visibility_c
     case ClientCommandKind::Reincarnate:
         HandleReincarnate(cmd, visibility_changed, sequence);
         return;
+    case ClientCommandKind::ActionInput: HandleActionInput(cmd); return;
     case ClientCommandKind::LoginUser:
-    case ClientCommandKind::LoginPassword:
-    case ClientCommandKind::ActionInput: return;
+    case ClientCommandKind::LoginPassword: return;
     }
+}
+
+void MvpOnlineBridge::HandleActionInput(const ClientCommand& cmd) {
+    if (!input_handler_) {
+        return;  // not hosting an engine world (no tank to drive)
+    }
+    const auto it = sessions_.find(cmd.session_id);
+    if (it == sessions_.end() || !it->second.spawned) {
+        return;  // input before spawn has no entity to drive
+    }
+    // Route to the session's OWN engine tank; the client never asserts which entity it controls.
+    input_handler_(it->second.entity.net_id, cmd.channel, cmd.value);
 }
 
 void MvpOnlineBridge::AddSession(const ClientCommand& cmd, bool& visibility_changed) {

@@ -1024,6 +1024,67 @@ TEST(MvpOnlineBridge, ReincarnateSpawnUsesRepairPadAndBroadcastsSpawnState) {
     std::filesystem::remove_all(root);
 }
 
+TEST(MvpOnlineBridge, ActionInputRoutesToSpawnedSessionEngineOid) {
+    const auto root = TempMapRoot();
+    const auto map_dir = root / "unit_map";
+    std::filesystem::create_directories(map_dir);
+    WriteTextFile(map_dir / "land", "2x2\n1000x800\n0 10\n0 20\n0 30\n0 40\n");
+
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "unit_map";
+    bootstrap.map_root = root.string();
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    // A spawn handler makes the session's tank a known engine oid; the input must route to it.
+    constexpr std::int32_t kEngineOid = 9100;
+    bridge.SetSpawnHandler([](std::int32_t, const std::array<float, 3>&,
+                              const std::array<float, 3>&) { return kEngineOid; });
+    std::int32_t routed_oid = 0;
+    std::int32_t routed_channel = -1;
+    float routed_value = 0.0F;
+    int route_calls = 0;
+    bridge.SetInputHandler([&](std::int32_t oid, std::int32_t channel, float value) {
+        routed_oid = oid;
+        routed_channel = channel;
+        routed_value = value;
+        ++route_calls;
+    });
+
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 1, 0, 0.0F, 0, 0, 0, "alice"});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 1, 0, 0, {}});  // team 1
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 0, 1, 0, {}});  // spawn
+    // forward channel at half throttle, AFTER spawn.
+    inbound.Push(ClientCommand{ClientCommandKind::ActionInput, 1, 1, 0.5F, 0, 0, 0, {}});
+    bridge.Tick(123);
+
+    EXPECT_EQ(route_calls, 1);
+    EXPECT_EQ(routed_oid, kEngineOid);
+    EXPECT_EQ(routed_channel, 1);
+    EXPECT_FLOAT_EQ(routed_value, 0.5F);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST(MvpOnlineBridge, ActionInputBeforeSpawnIsNotRouted) {
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound);
+
+    int route_calls = 0;
+    bridge.SetInputHandler([&](std::int32_t, std::int32_t, float) { ++route_calls; });
+
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 1, 0, 0.0F, 0, 0, 0, "alice"});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+    // Action arrives while the session is connected but has NOT spawned a tank.
+    inbound.Push(ClientCommand{ClientCommandKind::ActionInput, 1, 1, 0.5F, 0, 0, 0, {}});
+    bridge.Tick(123);
+
+    EXPECT_EQ(route_calls, 0);
+}
+
 TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveUdpUpdatesForEachOther) {
     const auto root = TempMapRoot();
     const auto map_dir = root / "unit_map";
