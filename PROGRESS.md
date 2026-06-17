@@ -399,12 +399,18 @@ session, each gated (build `/W4 /WX`, lint PASS, full CTest):
 - **Increment 2 — producer (`635e4aa`).** `Connection::OnUdpPacket` decodes in-game `0x09`/`0x0A` and
   enqueues one validated `ActionInput` command per drivable channel (channel ∈ 0..21, value clamped
   [-1,1]); never trusts the client-asserted entity id; pre-game ignored, malformed dropped. 2 TDD tests.
-- **Increment 3 (NEXT — needs a live two-client drive test).** Store per-session channels; build a
-  vehicle controller per player tank on spawn (mirror `SetupServerTanks`); drive each player tank from
-  its stored input in `DriveServerTanks` (channel index == tuning slot, the engine's native mapping:
-  write decoded value → `VehicleTuningTable` slot[channel], then the thrust step already runs). Deferred
-  from the overnight batch because its only observable effect is a moved engine entity — an engine-poke
-  that wants the running engine + human eyes, not a unit test. Plan + RE-verified apply offsets:
+- **Increment 3a — route to oid (`25028e2`).** `MvpOnlineBridge::HandleActionInput` consumes the
+  `ActionInput` command, maps the session to its spawned engine oid (`session.entity.net_id`), and
+  calls an `InputHandler` hook `(oid, channel, value)`; pre-spawn input is dropped. Completes the
+  wire→decode→validate→route-by-oid pipeline in tested code (no engine poke). 2 TDD tests. A
+  no-regression boot-smoke (after tonight's hot-path changes) confirmed the server still boots, ticks
+  ~400×, relays, and drives the demo tanks with zero faults.
+- **Increment 3b (NEXT — LIVE-ONLY).** Engine glue arms `SetInputHandler` to store input per oid,
+  builds a controller per player tank on spawn (reuse the resolved shared model/param2), and drives
+  each player tank from its routed input in `DriveServerTanks`. Blocked on a live two-client drive
+  test: only observable as a moved entity, and the channel→slot mapping is a known unknown (demo proves
+  slot 2=fwd / slot 1=turn for unit_type 0, but the client-channel→slot binding needs live confirm —
+  a hypothesis test, not implementable on a guess). Plan + RE-verified apply offsets:
   `docs/superpowers/plans/2026-06-17-m6.4-action-input-routing.md`.
 
 ### ✅ M6.3 — in-game UDP `0x0E`/`0x0F` delta relay shipped (`3dc283c`, 2026-06-17)
