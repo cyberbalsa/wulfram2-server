@@ -942,7 +942,18 @@ TEST(MvpOnlineBridge, ReincarnateSpawnUsesRepairPadAndBroadcastsSpawnState) {
     bool saw_tank = false;
     bool saw_reincarnate = false;
     bool saw_birth = false;
+    bool saw_udp_self = false;
     for (const OutboundMessage& msg : messages) {
+        if (!msg.reliable) {
+            // In-game updates are raw UDP datagrams ([opcode byte][body]); a spawned session
+            // receives its own state via a 0x0F VIEW_UPDATE.
+            if (!msg.bytes.empty() &&
+                msg.bytes.front() == static_cast<std::uint8_t>(Opcode::ViewUpdate) &&
+                msg.session_id == 1) {
+                saw_udp_self = true;
+            }
+            continue;
+        }
         const Frame frame = FirstFrame(msg.bytes);
         saw_tank = saw_tank || frame.opcode == static_cast<std::uint8_t>(Opcode::TankSpawn);
         saw_reincarnate =
@@ -952,18 +963,12 @@ TEST(MvpOnlineBridge, ReincarnateSpawnUsesRepairPadAndBroadcastsSpawnState) {
     EXPECT_TRUE(saw_tank);
     EXPECT_TRUE(saw_reincarnate);
     EXPECT_TRUE(saw_birth);
-
-    const auto snapshot = FirstViewUpdateForSession(messages, 1);
-    ASSERT_TRUE(snapshot.has_value());
-    const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
-    EXPECT_EQ(CountEntitiesMatching(entities, 27, 1, false), 1);
-    EXPECT_EQ(CountEntitiesMatching(entities, 27, 2, false), 1);
-    EXPECT_EQ(CountEntitiesMatching(entities, 0, 1, true), 1);
+    EXPECT_TRUE(saw_udp_self);
 
     std::filesystem::remove_all(root);
 }
 
-TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
+TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveUdpUpdatesForEachOther) {
     const auto root = TempMapRoot();
     const auto map_dir = root / "unit_map";
     std::filesystem::create_directories(map_dir);
@@ -994,21 +999,27 @@ TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
     bridge.Tick(123);
     const auto messages = outbound.DrainAll();
 
-    std::array<bool, 3> saw_snapshot{};
+    std::array<bool, 3> saw_self{};
+    std::array<bool, 3> saw_others{};
     for (const OutboundMessage& msg : messages) {
-        ASSERT_TRUE(msg.reliable);
-        const Frame frame = FirstFrame(msg.bytes);
-        if (frame.opcode != static_cast<std::uint8_t>(Opcode::ViewUpdate)) {
+        // In-game updates are raw UDP datagrams ([opcode byte][body]); spawned players are not
+        // sent the reliable TCP entry-map snapshot.
+        if (msg.reliable || msg.bytes.empty() || msg.session_id >= saw_self.size()) {
             continue;
         }
-        EXPECT_EQ(CountEntitiesInViewUpdate(frame), 4);
-        if (msg.session_id < saw_snapshot.size()) {
-            saw_snapshot.at(static_cast<std::size_t>(msg.session_id)) = true;
+        const auto idx = static_cast<std::size_t>(msg.session_id);
+        if (msg.bytes.front() == static_cast<std::uint8_t>(Opcode::ViewUpdate)) {
+            saw_self.at(idx) = true;
+        } else if (msg.bytes.front() == static_cast<std::uint8_t>(Opcode::UpdateArray)) {
+            saw_others.at(idx) = true;
         }
     }
 
-    EXPECT_TRUE(saw_snapshot.at(1));
-    EXPECT_TRUE(saw_snapshot.at(2));
+    // Each spawned session gets a 0x0F self update AND a 0x0E others update (the other tank).
+    EXPECT_TRUE(saw_self.at(1));
+    EXPECT_TRUE(saw_self.at(2));
+    EXPECT_TRUE(saw_others.at(1));
+    EXPECT_TRUE(saw_others.at(2));
     std::filesystem::remove_all(root);
 }
 

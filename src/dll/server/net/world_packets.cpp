@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -419,7 +420,12 @@ auto RuntimeWorldBootstrapConfig() -> WorldBootstrapConfig {
     return bootstrap;
 }
 
-void WriteEntity(BitWriter& writer, const MvpEntitySnapshot& entity) {
+// Serialize one entity into the update array, writing only the fields the `mask` selects (matches
+// the client's strict mask-bit read order: DEFINITION bit0, POS bit1, ROT bit3, HEALTH bit5). The
+// DEFINITION block (creation info) is sent the first time a session sees an entity; steady-state
+// updates send POS|ROT only, which is what lets the client INTERPOLATE rather than snap. A set mask
+// bit MUST have its payload (and vice versa) or the client desyncs.
+void WriteEntity(BitWriter& writer, const MvpEntitySnapshot& entity, std::uint32_t mask) {
     static const QuantConfig kPosConfig = MakeQuantConfig(
         QuantSpec{kVectorHeaderBits, kVectorTotalBits, kPositionMax, kPositionRange});
     static const QuantConfig kRotConfig = MakeQuantConfig(
@@ -429,24 +435,30 @@ void WriteEntity(BitWriter& writer, const MvpEntitySnapshot& entity) {
 
     writer.WriteI32(entity.net_id);
     writer.WriteBool(entity.is_manned);
-    writer.WriteBits(kFullSnapshotMask, kEntityMaskBits);
+    writer.WriteBits(mask, kEntityMaskBits);
     writer.WriteBits(0, kBankSelectorBits);
-    writer.WriteBits(static_cast<std::uint32_t>(entity.unit_type), kIdBits);
-    writer.WriteBits(static_cast<std::uint32_t>(entity.team), kIdBits);
-    writer.WriteBits(static_cast<std::uint32_t>(entity.team), kIdBits);
-    if (entity.unit_type == kDecorationUnitType) {
-        writer.WriteI32(0);
-        writer.WriteI32(0);
-    } else if (entity.unit_type == kCargoBoxUnitType) {
-        writer.WriteBits(static_cast<std::uint32_t>(entity.cargo_unit_type), kIdBits);
+    if ((mask & kMaskDefinition) != 0U) {
+        writer.WriteBits(static_cast<std::uint32_t>(entity.unit_type), kIdBits);
+        writer.WriteBits(static_cast<std::uint32_t>(entity.team), kIdBits);
+        writer.WriteBits(static_cast<std::uint32_t>(entity.team), kIdBits);
+        if (entity.unit_type == kDecorationUnitType) {
+            writer.WriteI32(0);
+            writer.WriteI32(0);
+        } else if (entity.unit_type == kCargoBoxUnitType) {
+            writer.WriteBits(static_cast<std::uint32_t>(entity.cargo_unit_type), kIdBits);
+        }
+        writer.WriteBool(true);  // force-snap to the definition transform
     }
-    writer.WriteBool(true);
-    // Field order follows the mask bit order (POS bit1, ROT bit3, HEALTH bit5). Rotation
-    // MUST be sent or map fixtures (repair pads/bases) render at a default orientation —
-    // i.e. "sideways". The reference marks loaded fixtures ROT-dirty, so it sends this too.
-    WriteVec3(writer, entity.pos, kPosConfig);
-    WriteVec3(writer, entity.rot, kRotConfig);
-    WriteQuantized(writer, entity.health, kStatConfig, 0);
+    // Rotation MUST be sent or map fixtures render at a default orientation ("sideways").
+    if ((mask & kMaskPosition) != 0U) {
+        WriteVec3(writer, entity.pos, kPosConfig);
+    }
+    if ((mask & kMaskRotation) != 0U) {
+        WriteVec3(writer, entity.rot, kRotConfig);
+    }
+    if ((mask & kMaskHealth) != 0U) {
+        WriteQuantized(writer, entity.health, kStatConfig, 0);
+    }
 }
 
 void WriteHardpointBlock(BitWriter& writer) {
@@ -621,9 +633,43 @@ auto BuildViewUpdateSnapshot(std::int32_t sequence, const std::vector<MvpEntityS
     const auto count = static_cast<std::uint8_t>(std::min(entities.size(), kMaxSnapshotEntities));
     writer.WriteBits(count, kEntityCountBits);
     for (std::size_t i = 0; i < count; ++i) {
-        WriteEntity(writer, entities.at(i));
+        WriteEntity(writer, entities.at(i), kFullSnapshotMask);
     }
     return Frame(Opcode::ViewUpdate, writer);
+}
+
+// One entity + the mask to send it with (DEFINITION-first-sight, then POS|ROT).
+struct EntityWrite {
+    MvpEntitySnapshot entity;
+    std::uint32_t mask = 0;
+};
+
+// Build a RAW in-game update datagram: [opcode byte][i32 ms-timestamp (0x0F only)][i32 sequence]
+// [stats block][u8 count][per-entity ...]. Mirrors the reference UpdateArrayPacket: 0x0F
+// (VIEW_UPDATE, self) carries a leading ms timestamp the client interpolates against; 0x0E
+// (UPDATE_ARRAY, others) omits it; the rest is identical. UDP framing is bare [opcode][bits] (no
+// TCP length prefix, no UDP seq prefix) -- so this returns writer.Bytes() directly, NOT Frame().
+auto BuildUpdateArray(Opcode opcode, bool is_view_update, std::int32_t timestamp_ms,
+                      std::int32_t sequence, const std::vector<EntityWrite>& entities,
+                      float local_health, float local_energy) -> std::vector<std::uint8_t> {
+    static const QuantConfig kStatConfig =
+        MakeQuantConfig(QuantSpec{kStatsBits, kNoDynamicTotal, kUnitFloatMax, kUnitFloatRange});
+    BitWriter writer;
+    writer.WriteByte(static_cast<std::uint8_t>(opcode));
+    if (is_view_update) {
+        writer.WriteI32(timestamp_ms);
+    }
+    writer.WriteI32(sequence);
+    writer.WriteBool(true);  // has local stats
+    writer.WriteBits(0, kLocalWeaponBits);
+    WriteQuantized(writer, local_health, kStatConfig, 0);
+    WriteQuantized(writer, local_energy, kStatConfig, 0);
+    const auto count = static_cast<std::uint8_t>(std::min(entities.size(), kMaxSnapshotEntities));
+    writer.WriteBits(count, kEntityCountBits);
+    for (std::size_t i = 0; i < count; ++i) {
+        WriteEntity(writer, entities.at(i).entity, entities.at(i).mask);
+    }
+    return writer.Bytes();
 }
 
 auto BuildTankSpawn(const TankSpawnSpec& spec) -> std::vector<std::uint8_t> {
@@ -993,16 +1039,71 @@ auto MvpOnlineBridge::ResolveSpawnPad(const SessionState& session, std::int32_t 
 }
 
 void MvpOnlineBridge::EmitSnapshots(std::uint32_t sequence) {
-    const auto entities = EntitySnapshots();
-    for (const auto& [id, session] : sessions_) {
+    const auto seq = static_cast<std::int32_t>(sequence);
+    // Monotonic ms clock for the 0x0F self timestamp (the client interpolates against its deltas;
+    // the absolute base is irrelevant). Captured once per emission.
+    const auto ts =
+        static_cast<std::int32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+    // Full world (static fixtures + engine dynamic entities) for the entry-map snapshot, and the
+    // dynamic-only set (tanks) for the in-game per-other relay.
+    const auto full = EntitySnapshots();
+    // Dynamic entities (tanks) = the non-static tail of the world: EntitySnapshots() emits the
+    // static fixtures FIRST, then the engine provider's entities (or, with no provider, the MVP
+    // session-projected tanks). The in-game 0x0E/0x0F carry only these dynamic entities; the
+    // fixtures ride the pre-spawn entry-map snapshot.
+    const std::size_t static_count = std::min(static_entities_.size(), full.size());
+    const std::vector<MvpEntitySnapshot> dynamic(
+        full.begin() + static_cast<std::ptrdiff_t>(static_count), full.end());
+
+    for (auto& [id, session] : sessions_) {
         if (!session.wants_updates) {
             continue;
         }
-        outbound_->Push(OutboundMessage{
-            id, true,
-            BuildViewUpdateSnapshot(static_cast<std::int32_t>(sequence), entities, 1.0F, 1.0F)});
-        WFH_TRACE("mvp", "queued MVP snapshot session=%llu entities=%zu",
-                  static_cast<unsigned long long>(id), entities.size());
+        if (!session.spawned) {
+            // Entry-map / pre-spawn: the client needs the full world (fixtures) to pick a pad.
+            // Reliable TCP VIEW_UPDATE, exactly as before — no regression to team-select/spawn.
+            outbound_->Push(
+                OutboundMessage{id, true, BuildViewUpdateSnapshot(seq, full, 1.0F, 1.0F)});
+            continue;
+        }
+        // In-game: UDP 0x0E(others) + 0x0F(self), per the reference player_sim_tick. Each entity
+        // gets DEFINITION the first time THIS session sees it, then POS|ROT (so the client
+        // interpolates). The fixtures persist from the pre-spawn snapshot; 0x0E carries only the
+        // dynamic tanks.
+        const std::int32_t self_id = session.entity.net_id;
+        // DEFINITION the first time this session sees an entity, then POS|ROT (so the client
+        // interpolates). `introduced` is the per-session list of net_ids already announced.
+        auto mask_for = [&session](std::int32_t net_id) -> std::uint32_t {
+            auto& seen = session.introduced;
+            if (std::find(seen.begin(), seen.end(), net_id) != seen.end()) {
+                return kMaskPosition | kMaskRotation;
+            }
+            seen.push_back(net_id);
+            return kFullSnapshotMask;
+        };
+        std::vector<EntityWrite> others;
+        const MvpEntitySnapshot* self = nullptr;
+        for (const auto& ent : dynamic) {
+            if (ent.net_id == self_id) {
+                self = &ent;
+                continue;
+            }
+            others.push_back(EntityWrite{ent, mask_for(ent.net_id)});
+        }
+        if (!others.empty()) {
+            outbound_->Push(OutboundMessage{
+                id, false,
+                BuildUpdateArray(Opcode::UpdateArray, false, 0, seq, others, 1.0F, 1.0F)});
+        }
+        // Self (0x0F): carries the ms timestamp the client interpolates against + HUD stats.
+        const MvpEntitySnapshot self_snap = (self != nullptr) ? *self : session.entity;
+        const std::vector<EntityWrite> self_vec{EntityWrite{self_snap, mask_for(self_id)}};
+        outbound_->Push(
+            OutboundMessage{id, false,
+                            BuildUpdateArray(Opcode::ViewUpdate, true, ts, seq, self_vec,
+                                             self_snap.health, self_snap.energy)});
     }
 }
 

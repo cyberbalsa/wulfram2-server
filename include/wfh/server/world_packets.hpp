@@ -92,6 +92,8 @@ private:
         MvpEntitySnapshot entity;
         bool spawned = false;
         bool wants_updates = false;
+        // net_ids this session has already been told about (DEFINITION sent once, then POS|ROT).
+        std::vector<std::int32_t> introduced;
     };
 
     void HandleCommand(const ClientCommand& cmd, bool& visibility_changed, std::uint32_t sequence);
