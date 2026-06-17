@@ -4,9 +4,11 @@
 #include "wfh/proto/bitstream.hpp"
 #include "wfh/proto/opcodes.hpp"
 #include "wfh/proto/validate.hpp"
+#include "wfh/server/action_input.hpp"
 #include "wfh/server/bringup_packets.hpp"
 #include "wfh/server/world_packets.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -307,6 +309,15 @@ auto Connection::OnUdpPacket(std::uint8_t opcode, const std::uint8_t* body, std:
         }
         return result;
     }
+    if (opcode == static_cast<std::uint8_t>(Opcode::ActionUpdate) ||
+        opcode == static_cast<std::uint8_t>(Opcode::ActionDump)) {
+        // Control inputs are only meaningful once the player is in-game and driving a tank.
+        // Fire-and-forget UDP (no ack); a malformed body is dropped, not fatal.
+        if (state_ == ConnState::InGame) {
+            HandleUdpActionInput(opcode, body, len);
+        }
+        return result;
+    }
     // The only UDP packet relevant pre-game is the HELLO(sub 1) session-key echo,
     // which links this connection's UDP endpoint. Anything else is ignored until
     // the game-state handlers explicitly validate it.
@@ -540,6 +551,32 @@ auto Connection::HandleUdpReincarnateRequest(const std::uint8_t* body, std::size
                   static_cast<int>(pid));
     }
     return true;
+}
+
+void Connection::HandleUdpActionInput(std::uint8_t opcode, const std::uint8_t* body,
+                                      std::size_t len) {
+    const DecodedActions decoded = (opcode == static_cast<std::uint8_t>(Opcode::ActionDump))
+                                       ? DecodeActionDump(body, len)
+                                       : DecodeActionUpdate(body, len);
+    if (!decoded.ok) {
+        WFH_DEBUG("conn", "session %llu dropped malformed ACTION opcode=0x%02X len=%zu",
+                  static_cast<unsigned long long>(session_id_), static_cast<unsigned>(opcode), len);
+        return;
+    }
+    std::size_t queued = 0;
+    for (const ActionChannelValue& change : decoded.changes) {
+        // Never trust a client-asserted index: only enqueue channels in the drivable range.
+        if (change.channel < 0 || change.channel > kActionMaxChannel) {
+            continue;
+        }
+        const float value = std::clamp(change.value, -1.0F, 1.0F);
+        inbound_->Push(ClientCommand{
+            ClientCommandKind::ActionInput, session_id_, change.channel, value, 0, 0, 0, {}});
+        ++queued;
+    }
+    WFH_TRACE("conn", "session %llu queued %zu ACTION channel(s) ts=%d opcode=0x%02X",
+              static_cast<unsigned long long>(session_id_), queued, decoded.timestamp,
+              static_cast<unsigned>(opcode));
 }
 
 auto Connection::QueueTeamReincarnate(std::int32_t team_id) -> bool {

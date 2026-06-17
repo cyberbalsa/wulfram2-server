@@ -111,6 +111,10 @@ private:
     [[nodiscard]] auto HandleReincarnateRequest(const std::uint8_t* body, std::size_t len) -> bool;
     [[nodiscard]] auto HandleUdpReincarnateRequest(const std::uint8_t* body, std::size_t len,
                                                    StepResult& out) -> bool;
+    // Decode an in-game ACTION_DUMP (0x09) / ACTION_UPDATE (0x0A) body and enqueue one validated
+    // ActionInput command per drivable channel (channel in range, value clamped to [-1,1]). The
+    // server maps session_id -> owned entity; the client-asserted entity id is never trusted.
+    void HandleUdpActionInput(std::uint8_t opcode, const std::uint8_t* body, std::size_t len);
     [[nodiscard]] auto QueueTeamReincarnate(std::int32_t team_id) -> bool;
     [[nodiscard]] auto QueueSpawnReincarnate(std::int32_t selected_entry_id, std::int32_t base_id)
         -> bool;

@@ -742,6 +742,61 @@ TEST(Connection, InGameUdpReincarnateSpawnRequestEnqueuesCommand) {
     EXPECT_EQ(cmds.at(0).pad_id, 99);
 }
 
+// Reach InGame on `conn` (accept -> UDP key echo -> login -> WANT_UPDATES) and drain any
+// commands enqueued along the way, leaving the queue empty for the caller's assertions.
+void DriveConnectionToInGame(Connection& conn, IncomingCmdQueue& inbound) {
+    (void)conn.OnAccept();
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    (void)conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                           echo_body.size());
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    (void)conn.OnTcpData(login.data(), login.size());
+    const auto want_updates = MakeFrame(Opcode::WantUpdates, [](wfh::proto::BitWriter&) {});
+    (void)conn.OnTcpData(want_updates.data(), want_updates.size());
+    (void)inbound.DrainAll();
+}
+
+TEST(Connection, InGameUdpActionUpdateEnqueuesActionInputCommands) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    DriveConnectionToInGame(conn, inbound);
+    ASSERT_EQ(conn.State(), ConnState::InGame);
+
+    // Real 0x0A capture body (post-opcode): count=2, ch1 (~0.120) + ch6 (~0).
+    const std::vector<std::uint8_t> body{0x02, 0x00, 0x00, 0x4a, 0xe7, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x01, 0x70, 0xa2, 0x00, 0x06, 0x80, 0x1f};
+    const auto step =
+        conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::ActionUpdate), body.data(), body.size());
+    EXPECT_FALSE(step.close);
+
+    const auto cmds = inbound.DrainAll();
+    ASSERT_EQ(cmds.size(), 2u);
+    EXPECT_EQ(cmds.at(0).kind, ClientCommandKind::ActionInput);
+    EXPECT_EQ(cmds.at(0).session_id, 1u);
+    EXPECT_EQ(cmds.at(0).channel, 1);
+    EXPECT_NEAR(cmds.at(0).value, 0.120F, 0.005F);
+    EXPECT_EQ(cmds.at(1).channel, 6);
+    EXPECT_NEAR(cmds.at(1).value, 0.0F, 0.01F);
+}
+
+TEST(Connection, UdpActionBeforeInGameIsIgnored) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();  // state = AwaitingKeyEcho, not InGame
+
+    const std::vector<std::uint8_t> body{0x01, 0x00, 0x00, 0x50, 0x83, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x06, 0x85, 0x87};
+    const auto step =
+        conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::ActionUpdate), body.data(), body.size());
+    EXPECT_FALSE(step.close);
+    EXPECT_TRUE(inbound.DrainAll().empty());
+}
+
 TEST(BringupPackets, UdpUpdateStatsMatchesPythonTeamSwitchBytes) {
     // Byte-for-byte match of the reference server's UPDATE_STATS (0x1C) emitted on a
     // team switch (captured: player_id=4 team=2). This is the packet that makes the
