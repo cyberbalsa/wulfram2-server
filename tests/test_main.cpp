@@ -43,13 +43,19 @@ TEST(Config, ParseLogLevel) {
     EXPECT_EQ(wfh::ParseLogLevel("level=\"warn\""), wfh::Level::Warn);
     EXPECT_EQ(wfh::ParseLogLevel("level = \"error\""), wfh::Level::Error);
     EXPECT_EQ(wfh::ParseLogLevel("[server]\nbind_port = 2627\n"),
-              wfh::Level::Debug);                                           // no level line
-    EXPECT_EQ(wfh::ParseLogLevel("level = \"bogus\""), wfh::Level::Debug);  // unrecognized
+              wfh::Level::Trace);                                           // no level line
+    EXPECT_EQ(wfh::ParseLogLevel("level = \"bogus\""), wfh::Level::Trace);  // unrecognized
     // Keys that merely *contain* "level" must not be treated as the level line.
     EXPECT_EQ(wfh::ParseLogLevel("noise_level = \"loud\"\n[log]\nlevel = \"warn\""),
               wfh::Level::Warn);
     // A comment/value containing a level word must not mis-fire; only the real key counts.
     EXPECT_EQ(wfh::ParseLogLevel("# set the error budget\nlevel = \"info\""), wfh::Level::Info);
+}
+
+TEST(Config, RuntimeConfigDefaultEnablesTrace) {
+    const std::string contents = ReadAll(std::filesystem::path("config") / "headless.toml");
+    ASSERT_FALSE(contents.empty());
+    EXPECT_EQ(wfh::ParseLogLevel(contents), wfh::Level::Trace);
 }
 
 TEST(LogTest, WritesToFileAndRespectsLevel) {

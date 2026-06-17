@@ -33,16 +33,19 @@ auto AddrOf(const void* ptr) -> std::uintptr_t {
 }  // namespace
 
 auto HooksInit() -> bool {
+    WFH_TRACE("hooks", "MH_Initialize begin");
     const MH_STATUS status = MH_Initialize();
     if (status != MH_OK) {
         WFH_FATAL("hooks", "MH_Initialize failed: %s", MH_StatusToString(status));
         return false;
     }
+    WFH_DEBUG("hooks", "MH_Initialize OK");
     return true;
 }
 
 auto InstallDetour(void* target, void* detour, void** original) -> bool {
-    WFH_INFO("hooks", "installing detour at %08x", static_cast<unsigned>(AddrOf(target)));
+    WFH_DEBUG("hooks", "installing detour target=%08x detour=%08x",
+              static_cast<unsigned>(AddrOf(target)), static_cast<unsigned>(AddrOf(detour)));
 
     const MH_STATUS created = MH_CreateHook(target, detour, original);
     if (created != MH_OK) {
@@ -50,7 +53,7 @@ auto InstallDetour(void* target, void* detour, void** original) -> bool {
                   MH_StatusToString(created));
         return false;
     }
-    WFH_INFO("hooks", "MH_CreateHook(%08x) OK", static_cast<unsigned>(AddrOf(target)));
+    WFH_DEBUG("hooks", "MH_CreateHook(%08x) OK", static_cast<unsigned>(AddrOf(target)));
 
     const MH_STATUS enabled = MH_EnableHook(target);
     if (enabled != MH_OK) {
@@ -58,11 +61,12 @@ auto InstallDetour(void* target, void* detour, void** original) -> bool {
                   MH_StatusToString(enabled));
         return false;
     }
-    WFH_INFO("hooks", "MH_EnableHook(%08x) OK", static_cast<unsigned>(AddrOf(target)));
+    WFH_DEBUG("hooks", "MH_EnableHook(%08x) OK", static_cast<unsigned>(AddrOf(target)));
     return true;
 }
 
 void HooksShutdown() {
+    WFH_DEBUG("hooks", "HooksShutdown begin");
     const MH_STATUS disabled = MH_DisableHook(MH_ALL_HOOKS);
     if (disabled != MH_OK) {
         WFH_WARN("hooks", "MH_DisableHook(ALL) failed: %s", MH_StatusToString(disabled));
@@ -71,6 +75,7 @@ void HooksShutdown() {
     if (uninit != MH_OK) {
         WFH_WARN("hooks", "MH_Uninitialize failed: %s", MH_StatusToString(uninit));
     }
+    WFH_DEBUG("hooks", "HooksShutdown done");
 }
 
 }  // namespace wfh

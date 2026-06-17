@@ -49,8 +49,16 @@ $Failed = $false
 # Run over our .cpp translation units; clang-tidy pulls the headers itself and
 # the .clang-tidy HeaderFilterRegex limits header diagnostics to wfh headers.
 Write-Host "==> clang-tidy" -ForegroundColor Cyan
+# Two files are x86-only and clang-tidy drives clang with the HOST x86_64 triple (the MSVC
+# compile_commands has no -m32 it can infer), so they are excluded from clang-tidy ONLY
+# (cppcheck below still scans them):
+#   * engine_thunks.cpp — `__declspec(naked)` + inline `__asm` register thunks; clang rejects
+#     the x86-only `naked` attribute outright.
+#   * dev_engine.cpp — reads x86 `CONTEXT.Eip`/`.Ebp` (the x64 `_CONTEXT` has Rip/Rbp), which
+#     clang-tidy can't parse under the x86_64 triple. The MSVC x86 build is correct.
 $Sources = Get-ChildItem -Path (Join-Path $RepoRoot "src") -Recurse -Filter *.cpp |
-    Select-Object -ExpandProperty FullName
+    Select-Object -ExpandProperty FullName |
+    Where-Object { $_ -notmatch '(engine_thunks|dev_engine)\.cpp$' }
 $TidyFailed = $false
 foreach ($src in $Sources) {
     & $ClangTidy -p $BuildDir --extra-arg=-Wno-unknown-warning-option --extra-arg=-Qunused-arguments $src

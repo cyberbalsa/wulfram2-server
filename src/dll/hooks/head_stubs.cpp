@@ -2,11 +2,17 @@
 
 #include "engine_hooks.hpp"
 
+#include "server/dev_engine.hpp"
+#include "server/world_host_engine.hpp"
+
 #include "wfh/log.hpp"
+#include "wfh/server/tick_guard.hpp"
+#include "wfh/server/world_packets.hpp"
 
 #include "addresses.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +73,12 @@ template <typename Func> auto AsVoidPtr(Func func) -> void* {
     return reinterpret_cast<void*>(func);
 }
 
+auto HwndValue(HWND hwnd) -> unsigned {
+    // Handles are pointer-sized Win32 values; this is logging-only.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(hwnd));
+}
+
 // ---------------------------------------------------------------------------
 // Approach B step 1: force the "Software Windowed" (GDI) renderer.
 //
@@ -82,6 +94,8 @@ template <typename Func> auto AsVoidPtr(Func func) -> void* {
 constexpr std::uint32_t kForceSoftwareWindowedFlagVA = 0x00679169;
 
 void ForceSoftwareRenderer() {
+    WFH_TRACE("head", "forcing Software Windowed flag at VA=0x%08X",
+              static_cast<unsigned>(kForceSoftwareWindowedFlagVA));
     // NOLINTNEXTLINE(performance-no-int-to-ptr,clang-analyzer-core.FixedAddressDereference)
     *static_cast<volatile std::uint8_t*>(TargetAt(kForceSoftwareWindowedFlagVA)) = 1;
     WFH_INFO("head", "Approach B: forced Software Windowed (DAT_00679169=1)");
@@ -135,6 +149,11 @@ auto WINAPI Hook_CreateWindowExA(
     // not appear on the taskbar or in the normal Z-order. The DC stays valid.
     const DWORD hidden_style = dwStyle & ~static_cast<DWORD>(WS_VISIBLE);
     const DWORD tool_ex_style = dwExStyle | static_cast<DWORD>(WS_EX_TOOLWINDOW);
+    WFH_TRACE("head", "CreateWindowExA class=%s title=%s style=0x%08lX hidden=0x%08lX ex=0x%08lX",
+              lpClassName != nullptr ? lpClassName : "<null>",
+              lpWindowName != nullptr ? lpWindowName : "<null>",
+              static_cast<unsigned long>(dwStyle), static_cast<unsigned long>(hidden_style),
+              static_cast<unsigned long>(tool_ex_style));
 
     if (!g_window_hidden_logged) {
         WFH_INFO("head", "Approach B: hiding main window (cleared WS_VISIBLE, +WS_EX_TOOLWINDOW)");
@@ -165,6 +184,8 @@ auto WINAPI Hook_ShowWindow(HWND hWnd, int nCmdShow) -> BOOL {
     if (hWnd != nullptr && hWnd == g_main_hwnd) {
         effective_cmd = SW_HIDE;
     }
+    WFH_TRACE("head", "ShowWindow hwnd=0x%08X cmd=%d effective=%d", HwndValue(hWnd), nCmdShow,
+              effective_cmd);
     using ShowWindow_t = BOOL(WINAPI*)(HWND, int);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     auto* const orig = reinterpret_cast<ShowWindow_t>(g_show_window_orig);
@@ -175,6 +196,7 @@ auto WINAPI Hook_ShowWindow(HWND hWnd, int nCmdShow) -> BOOL {
 // and returns false on any failure. Kept as a helper so InstallWindowHider stays
 // under the cognitive-complexity gate.
 auto HookUser32Export(HMODULE user32, const char* name, void* detour, void** original) -> bool {
+    WFH_DEBUG("head", "installing user32 hook %s", name);
     // GetProcAddress returns FARPROC; reinterpret to the typed pointer we hook.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     void* const target = reinterpret_cast<void*>(GetProcAddress(user32, name));
@@ -190,6 +212,7 @@ auto HookUser32Export(HMODULE user32, const char* name, void* detour, void** ori
 }
 
 auto InstallWindowHider() -> bool {
+    WFH_DEBUG("head", "installing window hider hooks");
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32 == nullptr) {
         WFH_FATAL("head", "Approach B: GetModuleHandleW(user32.dll) failed (%lu)", GetLastError());
@@ -349,14 +372,111 @@ auto __cdecl Stub_Client_RunMainLoop_Observe() -> void {
 // VA pinned here (gen/addresses.h holds functions only).
 constexpr std::uint32_t kClientRenderFrameVA = 0x004281a0;
 
+// Net_ServiceConnection @ 0x0046b830 (void __stdcall) is called UNCONDITIONALLY every
+// iteration of Client_Main's loop, BEFORE the DAT_005b83f4 render gate. It is therefore
+// the always-pumped seam for the headless server tick — unlike Client_RenderFrame, which
+// only runs when the (hidden) window is "active" and so dies during login/connect. See
+// memory/m4-tick-seam-render-gated.
+constexpr std::uint32_t kNetServiceConnectionVA = 0x0046b830;
+
+// Net_SendHelloName @ 0x0046b690 (void __stdcall): sends the UDP HELLO key echo (sub 1)
+// using the stored session key (DAT_00677f24). Normally driven by the render-gated login
+// screen update, which never runs headless — so we drive it from the server tick.
+constexpr std::uint32_t kNetSendHelloNameVA = 0x0046b690;
+
+// DAT_00678267: engine flag set to 1 by Net_HandleHello once it stores the server's
+// session key. Gate for driving the key echo above.
+constexpr std::uint32_t kEngineKeyRecvFlagVA = 0x00678267;
+
 // Per-tick pacing when render is neutered (ms). Matches the engine's native idle
 // Util_SleepMillis(100) cadence (~10 Hz). M5 can lower this for a faster server tick.
 constexpr DWORD kServerTickPaceMs = 100;
 
-auto WINAPI Stub_Client_RenderFrame() -> void {
-    // No rendering on a headless server. Pace the tick so the inline loop does not
-    // busy-spin when the window proc has set the render gate.
+// Exit code raised when the guarded server tick catches an SEH fault ('WT').
+constexpr UINT kTickFaultExitCode = 0x5754;
+
+// Monotonic tick breadcrumb for our guarded tick seam. This is not game state and
+// does not cross to clients; it is crash-diagnostic metadata only.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<std::uint64_t> g_guarded_tick{0};
+
+// Trampoline to the real Net_ServiceConnection (filled by InstallDetour). Our tick
+// detour calls through to it so the engine's connection keeps being serviced.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+void* g_net_service_connection_orig = nullptr;
+
+void __cdecl PaceServerTick(void* /*user*/) {
+    // Only reached when the window proc has set the render gate (DAT_005b83f4 != 0).
+    // We neuter the draw and pace so the loop does not busy-spin. The actual server
+    // tick now lives on Net_ServiceConnection (always pumped), not here.
+    WFH_TRACE("tick", "Client_RenderFrame suppressed; pacing %lums",
+              static_cast<unsigned long>(kServerTickPaceMs));
     Sleep(kServerTickPaceMs);
+}
+
+auto WINAPI Stub_Client_RenderFrame() -> void {
+    server::TickBreadcrumb breadcrumb;
+    breadcrumb.tick = g_guarded_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+    breadcrumb.phase = "Client_RenderFrame";
+    const server::TickGuardResult result =
+        server::RunProtectedTick(breadcrumb, &PaceServerTick, nullptr);
+    if (!result.ok) {
+        Log::Shutdown();
+        ExitProcess(kTickFaultExitCode);
+    }
+}
+
+// The headless server tick body, driven from the always-pumped Net_ServiceConnection
+// seam. Drives (a) the engine self-connection handshake and (b) the MVP online bridge.
+void __cdecl ServerTickBody(void* /*user*/) {
+    // Self-connection drive: the injected instance connects to its OWN server socket as
+    // a client. The login-screen update (@ 0x004622e0) that would echo the session key
+    // over UDP is render-gated and never runs headless, so once the engine has stored
+    // the server's session key we drive its own key-echo sender. On the engine main
+    // thread (this detour runs inside Net_ServiceConnection), so it is ABI-/thread-safe.
+    static bool s_drove_key_echo = false;
+    // NOLINTBEGIN(clang-analyzer-core.FixedAddressDereference)
+    const auto engine_key_recv =
+        *static_cast<volatile std::uint8_t*>(TargetAt(kEngineKeyRecvFlagVA));
+    // NOLINTEND(clang-analyzer-core.FixedAddressDereference)
+    if (!s_drove_key_echo && engine_key_recv == 1) {
+        WFH_INFO("tick", "self-connection: engine has session key; driving Net_SendHelloName");
+        // Net_SendHelloName is void __stdcall(void); TargetAt yields its entry point.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        reinterpret_cast<void(__stdcall*)()>(TargetAt(kNetSendHelloNameVA))();
+        s_drove_key_echo = true;
+    }
+
+    server::ProcessMvpOnlineTick(
+        static_cast<std::uint32_t>(g_guarded_tick.load(std::memory_order_relaxed)));
+
+    // M5.4: when [server] world_host is set, drive the engine's own world-entry
+    // (reset -> load map -> game mode -> spawn) so the engine owns + ticks the world.
+    // Runs on the engine main thread inside this SEH-guarded tick. No-op otherwise.
+    server::ProcessWorldHostTick();
+
+    // Dev console: execute any pending `call` on this (engine) thread + capture the thread
+    // id for `bt`. Cheap no-op when nothing is pending.
+    server::PumpDevEngine();
+}
+
+// Detour for Net_ServiceConnection (void __stdcall). Calls the engine's real net pump
+// first, then runs our guarded server tick. This seam fires every Client_Main loop
+// iteration regardless of the render gate, so the tick survives login/connect.
+auto WINAPI Stub_Net_ServiceConnection() -> void {
+    if (g_net_service_connection_orig != nullptr) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        reinterpret_cast<void(__stdcall*)()>(g_net_service_connection_orig)();
+    }
+    server::TickBreadcrumb breadcrumb;
+    breadcrumb.tick = g_guarded_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+    breadcrumb.phase = "Net_ServiceConnection";
+    const server::TickGuardResult result =
+        server::RunProtectedTick(breadcrumb, &ServerTickBody, nullptr);
+    if (!result.ok) {
+        Log::Shutdown();
+        ExitProcess(kTickFaultExitCode);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +485,7 @@ auto WINAPI Stub_Client_RenderFrame() -> void {
 // Install the registry-gate + browser bypass detours. The detours never call
 // through, so each trampoline is discarded.
 auto InstallRegistryGateBypass() -> bool {
+    WFH_DEBUG("head", "installing registry/browser bypass hooks");
     struct Bypass {
         const char* name;
         void* target;
@@ -394,6 +515,7 @@ auto InstallRegistryGateBypass() -> bool {
 // this one CALLS THROUGH for non-boot callers, so it passes the real trampoline
 // slot (g_app_exit_gracefully_orig) to InstallDetour. Returns true on success.
 auto InstallAppExitGracefullyGuard() -> bool {
+    WFH_DEBUG("head", "installing App_ExitGracefully guard");
     if (!InstallDetour(TargetAt(addr::App_ExitGracefully), AsVoidPtr(&Stub_App_ExitGracefully),
                        &g_app_exit_gracefully_orig)) {
         WFH_FATAL("head", "M3.7: failed to install App_ExitGracefully boot-exit guard");
@@ -408,6 +530,7 @@ auto InstallAppExitGracefullyGuard() -> bool {
 // never calls through (no rendering), so the trampoline is discarded. Returns true
 // on success.
 auto InstallServerTick() -> bool {
+    WFH_DEBUG("head", "installing Client_RenderFrame server tick hook");
     void* original = nullptr;
     if (!InstallDetour(TargetAt(kClientRenderFrameVA), AsVoidPtr(&Stub_Client_RenderFrame),
                        &original)) {
@@ -421,12 +544,28 @@ auto InstallServerTick() -> bool {
     return true;
 }
 
+// Install the always-pumped server tick on Net_ServiceConnection. CALLS THROUGH to the
+// engine's real net pump (trampoline in g_net_service_connection_orig), then runs our
+// guarded tick (self-connection handshake drive + MVP bridge). Returns true on success.
+auto InstallServerNetTick() -> bool {
+    WFH_DEBUG("head", "installing Net_ServiceConnection server tick hook");
+    if (!InstallDetour(TargetAt(kNetServiceConnectionVA), AsVoidPtr(&Stub_Net_ServiceConnection),
+                       &g_net_service_connection_orig)) {
+        WFH_FATAL("head", "failed to install Net_ServiceConnection server tick");
+        return false;
+    }
+    WFH_INFO("head", "server tick installed on Net_ServiceConnection (always-pumped seam, "
+                     "survives login/connect)");
+    return true;
+}
+
 // Observation detour for Client_RunMainLoop @ 0x4a0aa0. NOTE: with the headless
 // server design (M4.2) we keep DAT_00677f1d == 0, so Client_Main's inline loop runs
 // forever and this terminal path is NOT taken. Kept as a tripwire: if it ever fires,
 // something set the connect/exit gate. The detour never calls through. Returns true
 // on success.
 auto InstallLoopObservationDetour() -> bool {
+    WFH_DEBUG("head", "installing Client_RunMainLoop observation hook");
     void* original = nullptr;
     if (!InstallDetour(TargetAt(addr::Client_RunMainLoop),
                        AsVoidPtr(&Stub_Client_RunMainLoop_Observe), &original)) {
@@ -440,6 +579,7 @@ auto InstallLoopObservationDetour() -> bool {
 }  // namespace
 
 auto InstallHeadStubs() -> bool {
+    WFH_DEBUG("head", "InstallHeadStubs begin");
     // Approach B step 1: force the GDI "Software Windowed" renderer before the game
     // resumes, so Render_SwitchActiveDriver picks it and never hits the "Hokey
     // Display Card" error box.
@@ -471,9 +611,21 @@ auto InstallHeadStubs() -> bool {
         return false;
     }
 
+    // Server tick on the always-pumped Net_ServiceConnection seam (runs every loop
+    // iteration regardless of the render gate), so the self-connection handshake drive
+    // and the MVP bridge survive the login/connect phase where Client_RenderFrame is
+    // not called. See memory/m4-tick-seam-render-gated.
+    if (!InstallServerNetTick()) {
+        return false;
+    }
+
     // Tripwire on the terminal Client_RunMainLoop path (should not fire under M4.2).
     // Live before the loader resumes the game thread.
-    return InstallLoopObservationDetour();
+    const bool loop_hooked = InstallLoopObservationDetour();
+    if (loop_hooked) {
+        WFH_DEBUG("head", "InstallHeadStubs complete");
+    }
+    return loop_hooked;
 }
 
 }  // namespace wfh
