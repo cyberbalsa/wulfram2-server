@@ -230,6 +230,32 @@ auto SpawnTankEntity(std::int32_t oid, std::int32_t unit_type, std::int32_t team
     return obj;
 }
 
+// M6.2 player spawn: oids for client tanks, distinct from the demo tanks (9001-9003) and map
+// fixtures, kept near the demo-tank magnitude so they fit the snapshot id bit width.
+constexpr std::int32_t kPlayerOidBase = 9100;
+constexpr std::int32_t kPlayerUnitType = 0;  // tank
+
+// Spawn a REAL engine tank for a reincarnating player at its pad so the authoritative relay
+// (ReadEngineWorld) includes it -- the client's TankSpawn then correlates with a tank that
+// actually appears in snapshots (otherwise it spawns a phantom -> loses sync -> "protocol
+// mismatch"). Returns the engine oid (0 on failure). Tick-thread-only (the bridge's SpawnOnPad,
+// driven by the same tick body just before ProcessWorldHostTick). Increment 1: spawn only
+// (static/kinematic) so players SEE each other; driving from input is the next step.
+auto SpawnPlayerTank(std::int32_t team, const std::array<float, 3>& pos,
+                     const std::array<float, 3>& rot) -> std::int32_t {
+    static std::int32_t next_player_oid = kPlayerOidBase;
+    const std::int32_t oid = next_player_oid++;
+    const void* obj = SpawnTankEntity(oid, kPlayerUnitType, team, pos, rot);
+    if (obj == nullptr) {
+        WFH_WARN("worldhost", "player engine-spawn failed oid=%d team=%d", oid, team);
+        return 0;
+    }
+    WFH_INFO("worldhost", "M6.2 player tank engine-spawned oid=%d team=%d pos=%.1f,%.1f,%.1f", oid,
+             team, static_cast<double>(pos.at(0)), static_cast<double>(pos.at(1)),
+             static_cast<double>(pos.at(2)));
+    return oid;
+}
+
 // The WorldBootstrap "Spawn" action spawns the PRIMARY tank (index 0); the extras are spawned in
 // the engine glue (SetupServerTanks) since they are a multi-tank drive concern, not part of the
 // pure host-tested bootstrap brain.
@@ -531,6 +557,13 @@ void ProcessWorldHostTick() {
         // tick thread during the bridge's snapshot emission.
         ProcessMvpBridge().SetWorldProvider(
             []() -> std::vector<MvpEntitySnapshot> { return ReadEngineWorld(); });
+        // Players reincarnate into REAL engine tanks (relayed by the provider above), so their
+        // TankSpawn correlates with a tank that actually appears in snapshots (no phantom-spawn
+        // desync), and they SEE each other.
+        ProcessMvpBridge().SetSpawnHandler([](std::int32_t team, const std::array<float, 3>& pos,
+                                              const std::array<float, 3>& rot) -> std::int32_t {
+            return SpawnPlayerTank(team, pos, rot);
+        });
         WFH_INFO("worldhost", "authoritative relay armed: clients now receive the engine world");
         logged_done = true;
     }

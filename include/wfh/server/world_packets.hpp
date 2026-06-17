@@ -74,6 +74,15 @@ public:
     using WorldProvider = std::function<std::vector<MvpEntitySnapshot>()>;
     void SetWorldProvider(WorldProvider provider);
 
+    // Spawns a REAL engine entity for a reincarnating player at its pad and returns the engine
+    // oid (0 = not hosting / failed). When set (world_host mode), the player's tank becomes part
+    // of the authoritative engine world the provider relays, so the TankSpawn id matches a tank
+    // that actually appears in snapshots -- otherwise the client spawns a phantom that never shows
+    // up, loses sync, and reports a protocol mismatch. Invoked on the tick thread in SpawnOnPad.
+    using SpawnHandler = std::function<std::int32_t(
+        std::int32_t team, const std::array<float, 3>& pos, const std::array<float, 3>& rot)>;
+    void SetSpawnHandler(SpawnHandler handler);
+
 private:
     struct SessionState {
         std::uint64_t session_id = 0;
@@ -111,6 +120,7 @@ private:
     std::vector<MvpEntitySnapshot> static_entities_;
     std::int32_t next_entity_id_ = 1;
     WorldProvider world_provider_;  // when set, supplies the authoritative world (M6.1)
+    SpawnHandler spawn_handler_;    // when set (world_host), spawns the player's real engine tank
 };
 
 // The process-lifetime MVP bridge (also the M6.1 relay once a world provider is set).

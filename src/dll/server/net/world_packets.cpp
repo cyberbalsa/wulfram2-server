@@ -673,6 +673,10 @@ void MvpOnlineBridge::SetWorldProvider(WorldProvider provider) {
     world_provider_ = std::move(provider);
 }
 
+void MvpOnlineBridge::SetSpawnHandler(SpawnHandler handler) {
+    spawn_handler_ = std::move(handler);
+}
+
 void MvpOnlineBridge::Tick(std::uint32_t sequence) {
     bool visibility_changed = false;
     for (const ClientCommand& cmd : inbound_->DrainAll()) {
@@ -805,7 +809,14 @@ void MvpOnlineBridge::HandleTeamSwitch(SessionState& session, std::int32_t team)
 void MvpOnlineBridge::SpawnOnPad(SessionState& session, const MvpEntitySnapshot& pad,
                                  std::uint32_t sequence, bool& visibility_changed) {
     session.entity = MvpEntitySnapshot{};
-    session.entity.net_id = next_entity_id_++;
+    // When hosting an engine world, spawn a REAL engine tank for the player and use ITS oid as the
+    // net_id, so the TankSpawn correlates with the tank the authoritative relay actually sends
+    // (ReadEngineWorld reports this oid). Without an engine world, fall back to the MVP id.
+    std::int32_t engine_oid = 0;
+    if (spawn_handler_) {
+        engine_oid = spawn_handler_(session.team, pad.pos, pad.rot);
+    }
+    session.entity.net_id = engine_oid != 0 ? engine_oid : next_entity_id_++;
     session.entity.unit_type = kDefaultUnitType;
     session.entity.team = session.team;
     session.entity.is_manned = true;
