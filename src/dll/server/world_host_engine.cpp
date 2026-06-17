@@ -117,28 +117,63 @@ constexpr std::uint32_t kMemBuffReadMode = 1;                      // mode arg f
 constexpr std::uint32_t kForceDrivenHandlerVA =
     0x005b8634;                                  // DAT_005b8634: local-player vehicle phys handler
 constexpr std::size_t kEntityHandlerOff = 0xc0;  // entity+0xc0 -> physics-integration handler ptr
+constexpr std::size_t kEntitySleepFlagOff =
+    0xae;  // entity+0xae: sleep flag (nonzero => RunWorldTick skips it)
 constexpr std::uint32_t kUpdateThrustSimVA =
     0x004f9e20;  // Vehicle_UpdateThrustSimulation(thiscall model; stack vehicle)
 constexpr int kControlDivisor = 50;  // tankVehicle+0x0c divisor (GetScaledValue denominator)
 constexpr std::uintptr_t kSlotStride = 0x20;     // tuning-table slot stride
 constexpr std::uintptr_t kSlotScaledOff = 0x10;  // slot+0x10: control field GetScaledValue divides
 constexpr std::uintptr_t kSlotRawOff = 0x18;  // slot+0x18: raw/cache field (slot-5 gate read here)
-constexpr int kSlotForward = 2;               // tuning slot 2 = forward channel
-constexpr int kSlotThrustIntensity = 5;       // tuning slot 5 = thrust-intensity gate
-constexpr float kDemoForwardInput =
-    1.0F;  // hardcoded forward [-1,1] (temp; ACTION input is the next step)
+constexpr int kSlotTurn = 1;              // tuning slot 1 = turn channel (negated -> model+0x74)
+constexpr int kSlotForward = 2;           // tuning slot 2 = forward channel
+constexpr int kSlotThrustIntensity = 5;   // tuning slot 5 = thrust-intensity gate
 constexpr float kThrustIntensity = 1.0F;  // slot-5 nonzero so UpdateThrustFx opens the gate
+
+// Multi-tank demo: the server authoritatively drives SEVERAL independent tanks at once -- a
+// capability the stock binary never had (it only ever drove the ONE local-player vehicle). The
+// Tank_Model (per-type registry singleton) and the control-slot table are SHARED scratch objects,
+// but the thrust step reads them synchronously during each call, so driving the tanks SEQUENTIALLY
+// (write this tank's slots -> call its step -> next tank) gives each its own force with no
+// cross-talk. Each tank gets a distinct bounded forward+turn demo input (temporary, until ACTION
+// input routing) so it traces its own path and stays near spawn. forward/turn in [-1,1].
+constexpr std::size_t kMaxServerTanks = 3;
+struct DemoDrive {
+    float forward;
+    float turn;
+};
+constexpr std::array<DemoDrive, kMaxServerTanks> kDemoDrive = {{
+    {0.30F, 0.80F},  // tank 0: tight forward+left circle near spawn
+    {0.0F, -1.0F},   // tank 1: spin right in place (bounded)
+    {0.0F, 1.0F},    // tank 2: spin left in place (bounded)
+}};
+// Extra (non-primary) tanks, spawned offset from the primary (index 0, from WorldBootstrap) so
+// they sit near it on valid terrain.
+struct ExtraSpawn {
+    std::int32_t oid;
+    float dx;
+    float dy;
+    std::int32_t team;
+};
+constexpr std::array<ExtraSpawn, kMaxServerTanks - 1> kExtraSpawns = {{
+    {9002, 400.0F, 0.0F, 2},
+    {9003, 0.0F, 400.0F, 1},
+}};
 
 // Mutable spike state lives in a function-local static (engine-thread-only), mirroring the
 // file's other statics — kept off file scope. `controller` is the server-owned 0x20-byte
 // vehicle-controller buffer (an array of void* so it is pointer-aligned for the vtable).
+struct ServerTank {
+    std::array<void*, kControllerSize / sizeof(void*)> controller{};  // own 0x20-byte Tank_Vehicle
+    void* entity = nullptr;    // engine entity (own, from spawn)
+    bool handler_set = false;  // force-driven physics handler installed on this entity yet?
+};
 struct VehicleDriveState {
-    std::array<void*, kControllerSize / sizeof(void*)> controller{};
-    void* entity = nullptr;       // test tank entity captured from DoSpawn
-    std::uint32_t model = 0;      // resolved Tank_Model (controller+0x10)
-    std::uint32_t slot_base = 0;  // *(param2) = control-slot table base
-    bool built = false;           // controller constructed yet?
-    bool handler_set = false;     // force-driven physics handler installed on the entity yet?
+    std::array<ServerTank, kMaxServerTanks> tanks{};
+    int tank_count = 0;       // entities registered (primary + extras spawned)
+    std::uint32_t model = 0;  // shared Tank_Model (per-type registry singleton, controller+0x10)
+    std::uint32_t slot_base = 0;  // shared control-slot table base (*(DAT_0067cd58))
+    bool built = false;           // controllers built yet?
 };
 auto DriveState() -> VehicleDriveState& {
     static VehicleDriveState state;
@@ -172,28 +207,38 @@ void DoLoadWorld(char* map_name) {
 // creator/is_local/deco = 0) then Obj_InitFromSpawn for transform + world-list/spatial
 // insertion. We leave DAT_005b83e0 = -1 (Game_ResetSession set it), and our oid != -1,
 // so Obj_InitFromSpawn does NOT enter-world / grab the local camera.
-void DoSpawn(const WorldHostEntitySpec& entity) {
-    WFH_INFO("worldhost", "Obj_Create(oid=%d, type=%d, team=%d)", entity.oid, entity.unit_type,
-             entity.team);
-    // creator (ECX, stored at entity+0xcc) must be > the lose-OID threshold DAT_0067cd0c
-    // (0 on a fresh world) for Obj_Create's LoseOid_IsHidden gate to pass — creator=0
-    // is rejected. The engine passes the spawn packet's objectId here; for our
-    // server-owned entity the oid (>0) is a fine positive id. is_local/deco = 0;
-    // owner=team mirrors Net_HandleTankSpawn's (teamOrFlag, teamOrFlag) pair.
-    void* obj = EngineObjCreate(entity.oid, entity.oid, 0, entity.unit_type, entity.team,
-                                entity.team, 0, 0);
+// Spawn one authoritative non-local tank entity into the loaded world and return it (nullptr on
+// reject). Mirrors the engine's own Net_HandleTankSpawn: Obj_Create then Obj_InitFromSpawn.
+// creator (ECX, stored at entity+0xcc) must be > the lose-OID threshold DAT_0067cd0c (0 on a fresh
+// world) for Obj_Create's LoseOid_IsHidden gate to pass — so we pass the oid (>0) as creator.
+// is_local/deco = 0; owner=team mirrors Net_HandleTankSpawn's (teamOrFlag, teamOrFlag) pair. We
+// leave DAT_005b83e0 = -1 (Game_ResetSession set it), and oid != -1, so Obj_InitFromSpawn does NOT
+// enter-world / grab the local camera.
+auto SpawnTankEntity(std::int32_t oid, std::int32_t unit_type, std::int32_t team,
+                     const std::array<float, 3>& pos, const std::array<float, 3>& rot) -> void* {
+    WFH_INFO("worldhost", "Obj_Create(oid=%d, type=%d, team=%d)", oid, unit_type, team);
+    void* obj = EngineObjCreate(oid, oid, 0, unit_type, team, team, 0, 0);
     if (obj == nullptr) {
-        WFH_WARN("worldhost", "Obj_Create returned null (oid=%d rejected); spawn skipped",
-                 entity.oid);
-        return;
+        WFH_WARN("worldhost", "Obj_Create returned null (oid=%d rejected); spawn skipped", oid);
+        return nullptr;
     }
-    WFH_INFO("worldhost", "Obj_InitFromSpawn(oid=%d, pos=%.1f,%.1f,%.1f)", entity.oid,
-             static_cast<double>(entity.pos.at(0)), static_cast<double>(entity.pos.at(1)),
-             static_cast<double>(entity.pos.at(2)));
-    EngineObjInitFromSpawn(obj, entity.pos.at(0), entity.pos.at(1), entity.pos.at(2),
-                           entity.rot.at(0), entity.rot.at(1), entity.rot.at(2));
-    DriveState().entity = obj;  // M6: remember the entity so we can attach a vehicle controller
-    WFH_INFO("worldhost", "spawned entity oid=%d into world list + spatial index", entity.oid);
+    WFH_INFO("worldhost", "Obj_InitFromSpawn(oid=%d, pos=%.1f,%.1f,%.1f)", oid,
+             static_cast<double>(pos.at(0)), static_cast<double>(pos.at(1)),
+             static_cast<double>(pos.at(2)));
+    EngineObjInitFromSpawn(obj, pos.at(0), pos.at(1), pos.at(2), rot.at(0), rot.at(1), rot.at(2));
+    WFH_INFO("worldhost", "spawned entity oid=%d into world list + spatial index", oid);
+    return obj;
+}
+
+// The WorldBootstrap "Spawn" action spawns the PRIMARY tank (index 0); the extras are spawned in
+// the engine glue (SetupServerTanks) since they are a multi-tank drive concern, not part of the
+// pure host-tested bootstrap brain.
+void DoSpawn(const WorldHostEntitySpec& entity) {
+    void* obj = SpawnTankEntity(entity.oid, entity.unit_type, entity.team, entity.pos, entity.rot);
+    if (obj != nullptr) {
+        DriveState().tanks.at(0).entity = obj;
+        DriveState().tank_count = 1;
+    }
 }
 
 // Thin dispatch: each case is a single call so the per-action logging do-while
@@ -225,6 +270,11 @@ void WriteU32(std::uintptr_t addr, std::uint32_t val) {
 void WriteF32(std::uintptr_t addr, float val) {
     // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast,clang-analyzer-core.FixedAddressDereference)
     *reinterpret_cast<float*>(addr) = val;
+}
+
+void WriteU8(std::uintptr_t addr, std::uint8_t val) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast,clang-analyzer-core.FixedAddressDereference)
+    *reinterpret_cast<std::uint8_t*>(addr) = val;
 }
 
 // Walk the engine's authoritative world list (DAT_006785e4) and extract a by-value
@@ -263,85 +313,118 @@ void LogWorldReadback() {
     const std::vector<MvpEntitySnapshot> world = ReadEngineWorld();
     WFH_INFO("worldhost", "engine world readback: %zu entit%s", world.size(),
              world.size() == 1 ? "y" : "ies");
-    if (!world.empty()) {
-        const MvpEntitySnapshot& head = world.front();
-        WFH_INFO("worldhost", "  entity[0] oid=%d type=%d team=%d pos=%.1f,%.1f,%.1f", head.net_id,
-                 head.unit_type, head.team, static_cast<double>(head.pos.at(0)),
-                 static_cast<double>(head.pos.at(1)), static_cast<double>(head.pos.at(2)));
+    // Log every tank's live pos/rot so independent multi-tank motion is visible (cap a few).
+    constexpr std::size_t kLogCap = 8;
+    for (std::size_t i = 0; i < world.size() && i < kLogCap; ++i) {
+        const MvpEntitySnapshot& ent = world.at(i);
+        WFH_INFO("worldhost",
+                 "  entity[%zu] oid=%d type=%d team=%d pos=%.1f,%.1f,%.1f rot=%.2f,%.2f,%.2f", i,
+                 ent.net_id, ent.unit_type, ent.team, static_cast<double>(ent.pos.at(0)),
+                 static_cast<double>(ent.pos.at(1)), static_cast<double>(ent.pos.at(2)),
+                 static_cast<double>(ent.rot.at(0)), static_cast<double>(ent.rot.at(1)),
+                 static_cast<double>(ent.rot.at(2)));
     }
 }
 
-// Increment 1: build a vehicle controller for the test entity ONCE and log whether the
-// engine resolved a model. vtable should be 0x543128 (Tank_Vehicle) and model should be
-// non-zero (its own vtable 0x5430e8) — a zero model means the headless boot did NOT
-// populate the vehicle-model registry, which would block this whole approach. Runs on the
-// SEH-guarded tick thread, so a bad call faults safely instead of crashing the engine.
-void BuildDriveController() {
+// One-shot: spawn the extra tanks (the primary is index 0 from the bootstrap) and build a vehicle
+// controller for every server tank. The model (controller+0x10, Tank_Model vtable 0x5430e8) and
+// the control-slot table (*(DAT_0067cd58)) are shared per-type/scratch objects, resolved once from
+// tank 0. Runs on the SEH-guarded tick thread, so a bad call faults safely.
+void SetupServerTanks(const WorldHostEntitySpec& primary) {
     VehicleDriveState& st = DriveState();
-    if (st.built || st.entity == nullptr) {
+    if (st.built || st.tanks.at(0).entity == nullptr) {
         return;
     }
-    st.built = true;  // one-shot regardless of outcome (avoid retrying a faulting call)
-    void* controller = static_cast<void*>(st.controller.data());
-    EngineTankConstruct(controller);
+    st.built = true;  // one-shot regardless of outcome (avoid retrying faulting calls)
 
+    // Spawn the extras near the primary, registering each that succeeds.
+    for (const ExtraSpawn& ex : kExtraSpawns) {
+        if (static_cast<std::size_t>(st.tank_count) >= kMaxServerTanks) {
+            break;
+        }
+        const std::array<float, 3> pos = {primary.pos.at(0) + ex.dx, primary.pos.at(1) + ex.dy,
+                                          primary.pos.at(2)};
+        void* obj = SpawnTankEntity(ex.oid, primary.unit_type, ex.team, pos, primary.rot);
+        if (obj != nullptr) {
+            st.tanks.at(static_cast<std::size_t>(st.tank_count)).entity = obj;
+            ++st.tank_count;
+        }
+    }
+
+    // Build a controller per tank; resolve the shared model + slot table from tank 0.
     const std::uint32_t param2 = DerefU32(kInitForEntityParam2VA);
     // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
     void* param2_ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(param2));
-    EngineVehicleInitForEntity(controller, st.entity, param2_ptr);
-
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    const auto ctrl_addr = reinterpret_cast<std::uintptr_t>(controller);
-    const std::uint32_t vtable = DerefU32(ctrl_addr + kVehicleVtableOff);
-    const std::uint32_t model = DerefU32(ctrl_addr + kVehicleModelOff);
-    st.model = model;  // M6.2: Tank_Model the thrust step runs on
-    st.slot_base = (param2 != 0) ? DerefU32(param2) : 0;  // *(param2) = control-slot table base
-    WFH_INFO("worldhost",
-             "M6 drive controller built: controller=0x%08X vtable=0x%08X (expect 0x543128) "
-             "model=0x%08X param2=0x%08X (model!=0 => vehicle-model registry present)",
-             static_cast<unsigned>(ctrl_addr), vtable, model, param2);
-    if (model != 0) {
-        WFH_INFO("worldhost", "M6 model vtable=0x%08X (expect 0x5430e8 tank) slot_base=0x%08X",
-                 DerefU32(model), st.slot_base);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(st.tank_count); ++i) {
+        void* controller = static_cast<void*>(st.tanks.at(i).controller.data());
+        EngineTankConstruct(controller);
+        EngineVehicleInitForEntity(controller, st.tanks.at(i).entity, param2_ptr);
+        if (i == 0) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            const auto ctrl_addr = reinterpret_cast<std::uintptr_t>(controller);
+            st.model = DerefU32(ctrl_addr + kVehicleModelOff);
+            st.slot_base = (param2 != 0) ? DerefU32(param2) : 0;
+        }
     }
+    WFH_INFO("worldhost",
+             "M6.2 multi-tank setup: %d tanks; shared model=0x%08X (expect vtable 0x5430e8) "
+             "slot_base=0x%08X param2=0x%08X",
+             st.tank_count, st.model, st.slot_base, param2);
 }
 
-// M6.2-min(b): drive the test tank each tick. Installs the force-driven physics handler once,
-// writes the control-input slots the engine reads, then calls the engine's OWN per-tank thrust
-// step so the global world tick integrates the resulting force into real motion. See the
-// kForceDrivenHandlerVA block for the RE rationale. Engine-thread-only (SEH-guarded tick).
-void DriveServerTank() {
+// M6.2: drive EVERY server tank each tick. For each tank: install the force-driven physics handler
+// once, write THIS tank's control-input slots, then call the engine's OWN per-tank thrust step. The
+// global world tick integrates the accumulated force into real motion. The slots/model are shared
+// but read synchronously inside each step call, so writing-then-calling per tank in sequence keeps
+// the tanks independent. See the kForceDrivenHandlerVA block. Engine-thread-only (SEH-guarded
+// tick).
+void DriveServerTanks() {
     VehicleDriveState& st = DriveState();
-    if (!st.built || st.entity == nullptr || st.model == 0 || st.slot_base == 0) {
+    if (!st.built || st.model == 0 || st.slot_base == 0) {
         return;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    const auto entity_addr = reinterpret_cast<std::uintptr_t>(st.entity);
+    const auto fwd_slot =
+        st.slot_base + (static_cast<std::uintptr_t>(kSlotForward) * kSlotStride) + kSlotScaledOff;
+    const auto turn_slot =
+        st.slot_base + (static_cast<std::uintptr_t>(kSlotTurn) * kSlotStride) + kSlotScaledOff;
+    const auto gate_slot = st.slot_base +
+                           (static_cast<std::uintptr_t>(kSlotThrustIntensity) * kSlotStride) +
+                           kSlotRawOff;
+    const auto div = static_cast<float>(kControlDivisor);
 
-    // One-shot: switch the entity from its kinematic handler to the force-driven one so
-    // EntityPhysics_IntegrateLinear consumes the thrust force accumulator (entity+0x24).
-    if (!st.handler_set) {
-        st.handler_set = true;
-        WriteU32(entity_addr + kEntityHandlerOff, kForceDrivenHandlerVA);
-        WFH_INFO("worldhost", "M6.2 drive: entity+0xc0 -> force-driven handler 0x%08X",
-                 kForceDrivenHandlerVA);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(st.tank_count); ++i) {
+        ServerTank& tk = st.tanks.at(i);
+        if (tk.entity == nullptr) {
+            continue;
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        const auto entity_addr = reinterpret_cast<std::uintptr_t>(tk.entity);
+
+        // One-shot per tank: kinematic -> force-driven handler so IntegrateLinear consumes the
+        // thrust force accumulator (entity+0x24) instead of doing pos += vel only.
+        if (!tk.handler_set) {
+            tk.handler_set = true;
+            WriteU32(entity_addr + kEntityHandlerOff, kForceDrivenHandlerVA);
+            WFH_INFO("worldhost", "M6.2 drive: tank %zu entity+0xc0 -> force-driven handler", i);
+        }
+
+        // Force-wake every tick: RunWorldTick skips entities whose sleep flag (entity+0xae) is set,
+        // and a slept entity is never integrated -- so our applied force can never raise its motion
+        // above the wake threshold (deadlock). Clearing the flag each tick keeps this authoritative
+        // tank perpetually integrated (the local player is kept awake the same way each tick).
+        WriteU8(entity_addr + kEntitySleepFlagOff, 0);
+
+        // Write this tank's input into the shared slots (raw = input * divisor; gate slot 5
+        // nonzero so Vehicle_UpdateThrustFx opens the thrust gate), then drive its step.
+        WriteF32(fwd_slot, kDemoDrive.at(i).forward * div);
+        WriteF32(turn_slot, kDemoDrive.at(i).turn * div);
+        WriteF32(gate_slot, kThrustIntensity);
+        // thiscall ECX=model, stack arg=this tank's Tank_Vehicle controller.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        const auto vehicle_ptr = reinterpret_cast<std::uintptr_t>(tk.controller.data());
+        auto vehicle_arg = static_cast<std::uint32_t>(vehicle_ptr);
+        SafeEngineInvoke(kUpdateThrustSimVA, st.model, 0, &vehicle_arg, 1);
     }
-
-    // Populate the control slots VehicleTuning_ComputeControlScalars reads (mirrors the local
-    // lag-queue, which never runs for a non-local entity). raw = input * divisor; the gate slot
-    // (5) must be nonzero or Vehicle_UpdateThrustFx leaves the thrust gate closed.
-    const auto fwd_slot = st.slot_base + (kSlotForward * kSlotStride) + kSlotScaledOff;
-    const auto gate_slot = st.slot_base + (kSlotThrustIntensity * kSlotStride) + kSlotRawOff;
-    WriteF32(fwd_slot, kDemoForwardInput * static_cast<float>(kControlDivisor));
-    WriteF32(gate_slot, kThrustIntensity);
-
-    // Drive the engine's per-tank thrust step (thiscall ECX=model, stack arg=tankVehicle). It
-    // computes control scalars, opens the gate, self-sets model+0x58/+0x5c, and accumulates
-    // force/torque onto the entity; the global RunWorldTick (already running) integrates it.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    const auto vehicle_ptr = reinterpret_cast<std::uintptr_t>(st.controller.data());
-    auto vehicle_arg = static_cast<std::uint32_t>(vehicle_ptr);
-    SafeEngineInvoke(kUpdateThrustSimVA, st.model, 0, &vehicle_arg, 1);
 }
 
 // Engine-malloc `size` bytes via the engine CRT heap. Returns 0 on fault/OOM. The buffers
@@ -455,8 +538,8 @@ void ProcessWorldHostTick() {
     // Once the world is populated, periodically read it back by value (the engine is
     // now the source of truth). M6.1 will feed this snapshot to connected clients.
     if (bootstrap.done()) {
-        BuildDriveController();  // M6 Increment 1: attach a vehicle controller to the test entity
-        DriveServerTank();       // M6.2-min(b): drive the engine's thrust step -> authentic motion
+        SetupServerTanks(bootstrap.plan().entity);  // M6.2: spawn extras + build all controllers
+        DriveServerTanks();  // M6.2: drive every server tank each tick (independent motion)
         LogWorldReadback();
     }
 }

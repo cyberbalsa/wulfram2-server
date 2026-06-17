@@ -354,6 +354,36 @@ Plan + full RE archive: `docs/superpowers/plans/2026-06-17-m6.2-min-b-drive-non-
   the DLL must mirror the `SyncAction`/`Range_LevelToValue` quantizer) → per-player per-entity drive.
   The hardcoded forward input in `DriveServerTank` is a temporary demo pending that input routing.
 
+### ✅ M6.2-min(b+) — multi-tank: the server authoritatively drives SEVERAL independent tanks (2026-06-17)
+**Milestone: the headless server now simulates MULTIPLE independent vehicles in real time — a
+capability the stock binary never had (it only ever drove the ONE local-player vehicle).**
+Live-verified: 3 tanks (oid 9001/9002/9003) each driven with a distinct bounded input move
+INDEPENDENTLY (distinct evolving pos + rot), stay near spawn, and none freeze. Build = **109/109
+CTest**, `lint.ps1` = **PASS**.
+- **No per-entity tables needed for sequential driving (simpler than the original plan's Step 3).**
+  `VehicleModel_FindById` returns a SHARED per-type registry model singleton, and the control-slot
+  table is a per-call scratchpad — the thrust step reads both synchronously during each call. So
+  `DriveServerTanks()` loops the tanks and, per tank, writes ITS input to the shared slots then
+  calls `Vehicle_UpdateThrustSimulation(sharedModel, thisTankController)`. Each tank has its own
+  entity + own 0x20-byte Tank_Vehicle controller (model/table shared). No aliasing.
+- **SLEEP mechanism RE'd + fixed (the crux for robust multi-entity drive).** `EntityPhysics_RunWorldTick
+  @0x4f8550` integrates an entity only if `*(char*)(entity+0xae) == 0` (awake) AND
+  `*(char*)(entity+0xac) != 0`. A slept entity (`+0xae != 0`) is NEVER integrated, so our applied
+  force can't raise its motion above the engine's wake threshold → freeze (a "spin in place" tank
+  with ~0 linear velocity slept and froze). The engine keeps the LOCAL player awake via
+  `EntityPhysics_WakeIfMotionAboveThreshold(DAT_00677f2c)` each tick, but that only wakes if motion
+  is already high. **Fix:** force-clear `entity+0xae = 0` each tick per server-driven tank (perpetual
+  wake) — verified the previously-frozen tank now moves continuously.
+- **Glue-only change** (`world_host_engine.cpp`): `VehicleDriveState` → `ServerTank[]`; `DoSpawn`
+  registers the primary (oid 9001) as tank 0; `SetupServerTanks()` spawns the extras (9002/9003,
+  offset from the primary) + builds all controllers; `DriveServerTanks()` drives each per tick
+  (force-wake + distinct demo input + thrust step). Readback logs all tanks. No host-tested code
+  touched (WorldBootstrap unchanged), so the 109-test suite is stable. Added `WriteU8`.
+- **Demo inputs are temporary** (tank 0 fwd+left circle, tanks 1/2 spin opposite ways — distinct +
+  bounded so they stay near spawn): they prove independent motion until inbound ACTION input routing
+  (`0x0A`/`0x09`) drives each tank from its player. Known refinement unchanged: altitude-hold while
+  driving (tanks drift slowly in z; full off-map travel still descends).
+
 ### ✅ M5.3 — team-select → entry-map → SPAWN works end-to-end; +2 follow-up fixes (2026-06-16)
 **Milestone: a real client can now pick a team, open the entry map, choose a repair pad, and spawn.**
 The blocker was a missing `UPDATE_STATS (0x1C)` on team switch — decoded from the user's own working
