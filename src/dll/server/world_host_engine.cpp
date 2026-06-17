@@ -100,13 +100,45 @@ constexpr std::uint32_t kNetHandleBehaviorVA = 0x0046dc00;         // __cdecl(p1
 constexpr std::uint32_t kMemBuffStructSize = 0x20;                 // BitBuf object size (recv path)
 constexpr std::uint32_t kMemBuffReadMode = 1;                      // mode arg for a read buffer
 
+// --- M6.2-min(b) drive: make the non-local tank MOVE under the engine's OWN thrust.
+// Root cause (RE'd + live-verified 2026-06-17): the engine dispatches the per-frame thrust
+// step (Vehicle_UpdateThrustSimulation @0x4f9e20, Tank_Model vtable[0]) for EXACTLY ONE
+// object -- the singleton local-player vehicle client -- inside Interp_StepSimulationSubsteps.
+// A non-local Obj_InitFromSpawn entity is never dispatched, so its forces are never produced.
+// The TRUE missing init is the entity's physics handler at entity+0xc0: a fresh spawn gets the
+// KINEMATIC handler (EntityPhysics_IntegrateLinear ignores the force accumulator at entity+0x24
+// and only does pos += vel*dt), while the local player gets the FORCE-DRIVEN damped handler
+// DAT_005b8634 (accel = force - vel*damping). So we (1) point entity+0xc0 at the force-driven
+// handler, (2) populate the control-input slots the engine reads, and (3) call the thrust step
+// ourselves each tick. The engine's global EntityPhysics_RunWorldTick then integrates
+// entity+0x24 -> entity+0x18 (vel) -> entity+0x0c (pos) and ZEROS the accumulator each tick --
+// so the slots + step must be re-applied every tick. (model+0x58/+0x5c "thrust magnitudes" are
+// a non-issue: Vehicle_UpdateEngineGlowScale self-inits them to 1.0 inside the step.)
+constexpr std::uint32_t kForceDrivenHandlerVA =
+    0x005b8634;                                  // DAT_005b8634: local-player vehicle phys handler
+constexpr std::size_t kEntityHandlerOff = 0xc0;  // entity+0xc0 -> physics-integration handler ptr
+constexpr std::uint32_t kUpdateThrustSimVA =
+    0x004f9e20;  // Vehicle_UpdateThrustSimulation(thiscall model; stack vehicle)
+constexpr int kControlDivisor = 50;  // tankVehicle+0x0c divisor (GetScaledValue denominator)
+constexpr std::uintptr_t kSlotStride = 0x20;     // tuning-table slot stride
+constexpr std::uintptr_t kSlotScaledOff = 0x10;  // slot+0x10: control field GetScaledValue divides
+constexpr std::uintptr_t kSlotRawOff = 0x18;  // slot+0x18: raw/cache field (slot-5 gate read here)
+constexpr int kSlotForward = 2;               // tuning slot 2 = forward channel
+constexpr int kSlotThrustIntensity = 5;       // tuning slot 5 = thrust-intensity gate
+constexpr float kDemoForwardInput =
+    1.0F;  // hardcoded forward [-1,1] (temp; ACTION input is the next step)
+constexpr float kThrustIntensity = 1.0F;  // slot-5 nonzero so UpdateThrustFx opens the gate
+
 // Mutable spike state lives in a function-local static (engine-thread-only), mirroring the
 // file's other statics — kept off file scope. `controller` is the server-owned 0x20-byte
 // vehicle-controller buffer (an array of void* so it is pointer-aligned for the vtable).
 struct VehicleDriveState {
     std::array<void*, kControllerSize / sizeof(void*)> controller{};
-    void* entity = nullptr;  // test tank entity captured from DoSpawn
-    bool built = false;      // controller constructed yet?
+    void* entity = nullptr;       // test tank entity captured from DoSpawn
+    std::uint32_t model = 0;      // resolved Tank_Model (controller+0x10)
+    std::uint32_t slot_base = 0;  // *(param2) = control-slot table base
+    bool built = false;           // controller constructed yet?
+    bool handler_set = false;     // force-driven physics handler installed on the entity yet?
 };
 auto DriveState() -> VehicleDriveState& {
     static VehicleDriveState state;
@@ -182,6 +214,19 @@ auto DerefU32(std::uintptr_t addr) -> std::uint32_t {
     return *reinterpret_cast<const std::uint32_t*>(addr);
 }
 
+// Write a 32-bit word / float to engine memory at `addr`. Engine-thread-only (called from the
+// SEH-guarded tick); the targets are writable heap (entity struct, tuning-slot table), not code,
+// so no page-protection flip is needed. Used by the M6.2 drive to set the entity handler + slots.
+void WriteU32(std::uintptr_t addr, std::uint32_t val) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast,clang-analyzer-core.FixedAddressDereference)
+    *reinterpret_cast<std::uint32_t*>(addr) = val;
+}
+
+void WriteF32(std::uintptr_t addr, float val) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast,clang-analyzer-core.FixedAddressDereference)
+    *reinterpret_cast<float*>(addr) = val;
+}
+
 // Walk the engine's authoritative world list (DAT_006785e4) and extract a by-value
 // snapshot of every entity. The engine is now the source of truth; this read runs on
 // the SEH-guarded tick thread (a stale/garbage pointer faults safely). The relay
@@ -249,13 +294,54 @@ void BuildDriveController() {
     const auto ctrl_addr = reinterpret_cast<std::uintptr_t>(controller);
     const std::uint32_t vtable = DerefU32(ctrl_addr + kVehicleVtableOff);
     const std::uint32_t model = DerefU32(ctrl_addr + kVehicleModelOff);
+    st.model = model;  // M6.2: Tank_Model the thrust step runs on
+    st.slot_base = (param2 != 0) ? DerefU32(param2) : 0;  // *(param2) = control-slot table base
     WFH_INFO("worldhost",
              "M6 drive controller built: controller=0x%08X vtable=0x%08X (expect 0x543128) "
              "model=0x%08X param2=0x%08X (model!=0 => vehicle-model registry present)",
              static_cast<unsigned>(ctrl_addr), vtable, model, param2);
     if (model != 0) {
-        WFH_INFO("worldhost", "M6 model vtable=0x%08X (expect 0x5430e8)", DerefU32(model));
+        WFH_INFO("worldhost", "M6 model vtable=0x%08X (expect 0x5430e8 tank) slot_base=0x%08X",
+                 DerefU32(model), st.slot_base);
     }
+}
+
+// M6.2-min(b): drive the test tank each tick. Installs the force-driven physics handler once,
+// writes the control-input slots the engine reads, then calls the engine's OWN per-tank thrust
+// step so the global world tick integrates the resulting force into real motion. See the
+// kForceDrivenHandlerVA block for the RE rationale. Engine-thread-only (SEH-guarded tick).
+void DriveServerTank() {
+    VehicleDriveState& st = DriveState();
+    if (!st.built || st.entity == nullptr || st.model == 0 || st.slot_base == 0) {
+        return;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto entity_addr = reinterpret_cast<std::uintptr_t>(st.entity);
+
+    // One-shot: switch the entity from its kinematic handler to the force-driven one so
+    // EntityPhysics_IntegrateLinear consumes the thrust force accumulator (entity+0x24).
+    if (!st.handler_set) {
+        st.handler_set = true;
+        WriteU32(entity_addr + kEntityHandlerOff, kForceDrivenHandlerVA);
+        WFH_INFO("worldhost", "M6.2 drive: entity+0xc0 -> force-driven handler 0x%08X",
+                 kForceDrivenHandlerVA);
+    }
+
+    // Populate the control slots VehicleTuning_ComputeControlScalars reads (mirrors the local
+    // lag-queue, which never runs for a non-local entity). raw = input * divisor; the gate slot
+    // (5) must be nonzero or Vehicle_UpdateThrustFx leaves the thrust gate closed.
+    const auto fwd_slot = st.slot_base + (kSlotForward * kSlotStride) + kSlotScaledOff;
+    const auto gate_slot = st.slot_base + (kSlotThrustIntensity * kSlotStride) + kSlotRawOff;
+    WriteF32(fwd_slot, kDemoForwardInput * static_cast<float>(kControlDivisor));
+    WriteF32(gate_slot, kThrustIntensity);
+
+    // Drive the engine's per-tank thrust step (thiscall ECX=model, stack arg=tankVehicle). It
+    // computes control scalars, opens the gate, self-sets model+0x58/+0x5c, and accumulates
+    // force/torque onto the entity; the global RunWorldTick (already running) integrates it.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto vehicle_ptr = reinterpret_cast<std::uintptr_t>(st.controller.data());
+    auto vehicle_arg = static_cast<std::uint32_t>(vehicle_ptr);
+    SafeEngineInvoke(kUpdateThrustSimVA, st.model, 0, &vehicle_arg, 1);
 }
 
 // Engine-malloc `size` bytes via the engine CRT heap. Returns 0 on fault/OOM. The buffers
@@ -370,6 +456,7 @@ void ProcessWorldHostTick() {
     // now the source of truth). M6.1 will feed this snapshot to connected clients.
     if (bootstrap.done()) {
         BuildDriveController();  // M6 Increment 1: attach a vehicle controller to the test entity
+        DriveServerTank();       // M6.2-min(b): drive the engine's thrust step -> authentic motion
         LogWorldReadback();
     }
 }

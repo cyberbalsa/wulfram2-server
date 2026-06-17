@@ -312,6 +312,48 @@ produced no motion. Ground-truth thrust math (decompiled this session):
   confirm motion → then route `0x0A`/`0x09` ACTION inputs per-session → per-player. See
   `memory/m6-tank-physics-drive-recipe`.
 
+### ✅ M6.2-min(b) — a non-local server tank DRIVES under the engine's own thrust physics (2026-06-17)
+**Milestone: a server-spawned (non-local) tank now physically MOVES under wulfram2.exe's own
+authentic vehicle physics — no reimplemented sim.** Live-verified end-to-end: the world-host test
+tank drove **x 2437→17212** across the map at **vel.x ≈ 81.6** (near the 85 cap), force-driven by
+the engine's thrust step; `ReadEngineWorld` relayed the moving position. RE'd via a 5-finder Ghidra
+workflow, validated live over the dev console, codified, and re-verified on a fresh injected session.
+Plan + full RE archive: `docs/superpowers/plans/2026-06-17-m6.2-min-b-drive-non-local-tank.md`.
+- **TRUE root cause (corrects the earlier "two zero fields" framing — those were downstream
+  symptoms of ONE cause):** the engine dispatches the per-frame thrust step
+  (`Vehicle_UpdateThrustSimulation @0x4f9e20`, **Tank_Model vtable[0]** @`0x5430e8`) for EXACTLY ONE
+  object — the singleton local-player client `DAT_006782b0` — inside `Interp_StepSimulationSubsteps
+  @0x469e00`. A non-local spawn is never dispatched, so its forces are never produced. Decisive new
+  find: the entity's **physics handler at `entity+0xc0`** selects the integration mode in
+  `EntityPhysics_IntegrateLinear @0x4f27a0`: a fresh `Obj_InitFromSpawn` entity gets the **KINEMATIC**
+  handler `0x5b861c` (byte+4≠0 → `pos += vel*dt`, **force at entity+0x24 IGNORED**), while the local
+  player gets the **force-driven damped** handler `DAT_005b8634` (byte+3≠0,byte+4=0 → `accel = force −
+  vel·damping`). **That handler is the real missing init.**
+- **Recipe (codified in `world_host_engine.cpp` `DriveServerTank()`):** spawn `unit_type=0` (tank);
+  build the controller (`Tank_Construct`+`VehicleInstance_InitForEntity`, model resolved by
+  `VehicleModel_FindById(0)`); **once:** set `entity+0xc0 = DAT_005b8634` (force-driven); **each tick:**
+  write control slots `base+n*0x20+0x10` (n=2 forward, raw=input*divisor 50) + slot-5 gate
+  `base+0xB8`(+0x18)=1.0, then `SafeEngineInvoke(Vehicle_UpdateThrustSimulation, ecx=model,
+  args=[tankVehicle])`. The engine's global `EntityPhysics_RunWorldTick @0x4f8550` integrates
+  `entity+0x24 (force) → +0x18 (vel) → +0x0c (pos)` and ZEROS the accumulator each tick — so the
+  step is re-driven every tick. Build = **109/109 CTest**, `lint.ps1` = **PASS**.
+- **Corrections to prior memory (multi-finder + disasm + live consensus):** (1) `model+0x58/+0x5c`
+  are NOT "thrust magnitudes loaded from config" — they are engine-glow scale factors
+  `Vehicle_UpdateEngineGlowScale @0x4f9790` re-inits to 1.0f every frame *inside the step* (don't
+  load/poke them). (2) Force lands on the **entity** (`+0x24` linear / `+0x48` torque), not physObj —
+  `tools/drive_probe.py`'s `physObj+0x08` velocity read is WRONG (vel is `entity+0x18`). (3) slot
+  **+0x10** = control field GetScaledValue divides; **+0x18** = raw/gate cache. (4) vehicle-model
+  ids: **0=tank, 1=medic** (the `world_host.hpp` "1 = tank" comment was wrong → fixed to 0);
+  `VehicleModel_FindById` returns **shared per-type registry model singletons** (so the model is a
+  per-call scratchpad — sequential per-entity driving is safe). (5) "slots 6/7" stays a dead red herring.
+- **Known refinement (next, M6.2-min(c)):** altitude-hold while driving — hover works at REST on the
+  pad (z held at −180), but driving full-forward sends the tank off the ~5600-unit `bpass` map into
+  the void where it descends (`vel.z` negative). The hover/ground-proximity lift in
+  `ApplyThrustForces` (reads `*(model+0x50)` jet-reaction surface) needs the surface to track terrain
+  as the tank moves. Then: route inbound `0x0A`/`0x09` ACTION packets (NO engine receiver exists —
+  the DLL must mirror the `SyncAction`/`Range_LevelToValue` quantizer) → per-player per-entity drive.
+  The hardcoded forward input in `DriveServerTank` is a temporary demo pending that input routing.
+
 ### ✅ M5.3 — team-select → entry-map → SPAWN works end-to-end; +2 follow-up fixes (2026-06-16)
 **Milestone: a real client can now pick a team, open the entry map, choose a repair pad, and spawn.**
 The blocker was a missing `UPDATE_STATS (0x1C)` on team switch — decoded from the user's own working

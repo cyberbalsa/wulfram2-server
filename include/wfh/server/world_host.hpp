@@ -63,9 +63,9 @@ constexpr std::int32_t kDefaultSpawnOid = 9001;
 // a single object; M6 scales to the full world). Plain value type.
 struct WorldHostEntitySpec {
     std::int32_t oid = kDefaultSpawnOid;  // OID handed to Obj_Create (engine registers it)
-    std::int32_t unit_type = 1;           // engine unit type id (1 = tank)
-    std::int32_t owner = 0;               // owning player id (0 = server-owned)
-    std::int32_t team = 1;                // team id
+    std::int32_t unit_type = 0;  // engine vehicle-model id (0 = tank, 1 = medic; live-verified)
+    std::int32_t owner = 0;      // owning player id (0 = server-owned)
+    std::int32_t team = 1;       // team id
     std::array<float, 3> pos{kDefaultSpawnX, kDefaultSpawnY, kDefaultSpawnZ};  // spawn position
     std::array<float, 3> rot{0.0F, 0.0F, 0.0F};                                // euler orientation
 };
