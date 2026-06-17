@@ -682,7 +682,11 @@ void MvpOnlineBridge::Tick(std::uint32_t sequence) {
     for (const ClientCommand& cmd : inbound_->DrainAll()) {
         HandleCommand(cmd, visibility_changed, sequence);
     }
-    if (visibility_changed) {
+    // Emit every tick (~the loop's ~10 Hz render-pacing cadence) so MOVING entities replicate
+    // continuously. Previously snapshots fired ONLY on visibility_changed (join/spawn/team-switch),
+    // which froze moving tanks between those events ("sync really low / only large updates").
+    // EmitSnapshots skips sessions that have not sent WANT_UPDATES, so this only streams in-game.
+    if (visibility_changed || !sessions_.empty()) {
         EmitSnapshots(sequence);
     }
 }
@@ -809,18 +813,27 @@ void MvpOnlineBridge::HandleTeamSwitch(SessionState& session, std::int32_t team)
 void MvpOnlineBridge::SpawnOnPad(SessionState& session, const MvpEntitySnapshot& pad,
                                  std::uint32_t sequence, bool& visibility_changed) {
     session.entity = MvpEntitySnapshot{};
+    // Spread players out from the shared pad so they don't spawn on top of each other -- the camera
+    // sits on the self-tank, so an overlapping peer is hidden right at the view origin (the cause
+    // of "didn't see the two clients"). Deterministic per player; applied to BOTH the engine spawn
+    // and the TankSpawn so the client's self-prediction and the server's authority agree.
+    constexpr float kPlayerSpawnSpread = 100.0F;
+    constexpr std::int32_t kPlayerSpawnLanes = 6;
+    std::array<float, 3> spawn_pos = pad.pos;
+    spawn_pos.at(0) +=
+        static_cast<float>(session.player_id % kPlayerSpawnLanes) * kPlayerSpawnSpread;
     // When hosting an engine world, spawn a REAL engine tank for the player and use ITS oid as the
     // net_id, so the TankSpawn correlates with the tank the authoritative relay actually sends
     // (ReadEngineWorld reports this oid). Without an engine world, fall back to the MVP id.
     std::int32_t engine_oid = 0;
     if (spawn_handler_) {
-        engine_oid = spawn_handler_(session.team, pad.pos, pad.rot);
+        engine_oid = spawn_handler_(session.team, spawn_pos, pad.rot);
     }
     session.entity.net_id = engine_oid != 0 ? engine_oid : next_entity_id_++;
     session.entity.unit_type = kDefaultUnitType;
     session.entity.team = session.team;
     session.entity.is_manned = true;
-    session.entity.pos = pad.pos;
+    session.entity.pos = spawn_pos;
     session.entity.rot = pad.rot;
     session.spawned = true;
 
