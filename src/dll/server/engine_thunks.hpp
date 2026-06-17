@@ -3,6 +3,8 @@
 #pragma once
 // NOLINTEND(portability-avoid-pragma-once)
 
+#include <cstdint>
+
 namespace wfh::server {
 
 // Hand-written asm thunks for engine functions whose calling convention no MSVC
@@ -31,5 +33,35 @@ auto EngineObjCreate(int creator, int oid, int is_local, int type, int owner, in
 // for a pure server), so a real-OID spawn stays a non-local object.
 void EngineObjInitFromSpawn(void* entity, float pos_x, float pos_y, float pos_z, float rot_x,
                             float rot_y, float rot_z);
+
+// Call Tank_Construct @ 0x4f9a40: __fastcall(ECX = controller). Base-constructs the
+// 0x20-byte vehicle controller (VehicleInstance_Construct) and installs the Tank_Vehicle
+// vtable (0x543128). Caller supplies a zeroed 0x20-byte buffer; returns it (EAX). This is
+// the per-tank controller the engine builds only for the local player — we build our own.
+auto EngineTankConstruct(void* controller) -> void*;
+
+// Call VehicleInstance_InitForEntity @ 0x4f63c0: __thiscall(ECX = controller; stack:
+// entity, param2). Binds the controller to the entity and RESOLVES its model from the
+// engine registry (VehicleModel_FindById(entity unit-type @+8), fallback id 0). Sets
+// controller+0x04 = entity, +0x08 = param2, +0x10 = model. param2 is the engine global
+// *(0x0067cd58). Callee cleans its 2 stack args.
+void EngineVehicleInitForEntity(void* controller, void* entity, void* param2);
+
+// Universal x86 invoker for the dev console's `call`: pushes `argc` dword stack args
+// (right-to-left), sets ECX/EDX (used by thiscall/fastcall; pass 0 otherwise), calls
+// `addr`, and returns EAX. ESP is restored from the frame, so it is correct for BOTH
+// caller-clean (cdecl) and callee-clean (stdcall/thiscall/fastcall) conventions.
+auto EngineRawInvoke(std::uint32_t addr, std::uint32_t ecx, std::uint32_t edx,
+                     const std::uint32_t* args, int argc) -> std::uint32_t;
+
+struct InvokeResult {
+    std::uint32_t eax = 0;
+    bool faulted = false;
+};
+
+// SEH-guarded EngineRawInvoke: a faulting target/args is caught (faulted=true) rather than
+// crashing the tick. Runs on the engine tick thread (the dev console marshals to it).
+auto SafeEngineInvoke(std::uint32_t addr, std::uint32_t ecx, std::uint32_t edx,
+                      const std::uint32_t* args, int argc) -> InvokeResult;
 
 }  // namespace wfh::server

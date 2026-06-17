@@ -53,4 +53,35 @@ constexpr std::int32_t kProtocolVersion = 0x4E89;  // 20105; the one hard handsh
                                     std::string_view name, std::string_view nametag)
     -> std::vector<std::uint8_t>;
 
+// ---------------------------------------------------------------------------
+// UDP reliable-stream handshake (server->client). Unlike the bring-up packets
+// above, these are RAW UDP datagram bodies ([opcode][body], NO TCP length frame
+// and NO seq prefix), matching the reference server's on_d_handshake. They set up
+// the client's gameplay streams; without them the client never accepts world/team
+// data (so team-select/entry/spawn stay inert). See memory/udp-stream-handshake-required.
+
+// 0x02 handshake ACK: [0x02][byte subcmd=0][i32 ticks].
+[[nodiscard]] auto BuildUdpHandshakeAck(std::int32_t ticks) -> std::vector<std::uint8_t>;
+
+// 0x03 D_HANDSHAKE stream definitions: [0x03][i32 ticks][i32 player_id][i32 def_count=4] +
+// 4x [string name][i32 id_count=1][i32 id] + [i32 cfg_count=4] + 4x [i32 stream_id][i32
+// priority=1].
+[[nodiscard]] auto BuildUdpStreamDefs(std::int32_t ticks, std::int32_t player_id)
+    -> std::vector<std::uint8_t>;
+
+// 0x04 stream control (UNPAUSE): [0x04][byte stream_id][u16 sequence=1].
+[[nodiscard]] auto BuildUdpStreamUnpause(std::uint8_t stream_id) -> std::vector<std::uint8_t>;
+
+// 0x0C ping reply (PONG): [0x0C][i32 echoed_timestamp].
+[[nodiscard]] auto BuildUdpPong(std::int32_t echoed_timestamp) -> std::vector<std::uint8_t>;
+
+// 0x1C UPDATE_STATS (raw UDP): a player's stat/team record. Sent to the requester right
+// after a team switch so the client updates its roster list and activates the entry-map /
+// respawn selector. Without it the client shows "you changed teams" but the list never
+// updates and the selector stays disabled. Matches the reference capture:
+// [0x1C][i32 player_id][i32 6][u16 team][u16 33][u16 3][u16 5][u16 9]
+// [fix16.16 1.0][fix16.16 1.0][i32 10].
+[[nodiscard]] auto BuildUdpUpdateStats(std::int32_t player_id, std::int32_t team)
+    -> std::vector<std::uint8_t>;
+
 }  // namespace wfh::server

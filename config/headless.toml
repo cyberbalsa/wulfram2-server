@@ -2,6 +2,8 @@
 bind_port = 2627
 tick_hz = 20
 map = "bpass"
+world_host = true
+# dev_port defaults to 6969 (live engine-poke command socket); set to 0 to disable.
 
 [log]
 level = "trace"

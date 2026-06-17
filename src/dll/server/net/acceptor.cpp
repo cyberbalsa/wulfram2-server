@@ -121,6 +121,19 @@ void SendUdpBytes(SOCKET sock, const sockaddr_in& peer_addr,
                   const std::vector<std::uint8_t>& bytes);
 auto ReadBoundPort(SOCKET sock, FallbackPort fallback) -> std::uint16_t;
 
+// Send a step's UDP output to `peer`: the single udp_out (if any) then each discrete
+// udp_datagram (the reliable-stream handshake emits several separate datagrams).
+void SendStepUdp(SOCKET sock, const sockaddr_in& peer, const StepResult& step) {
+    if (!step.udp_out.empty()) {
+        SendUdpBytes(sock, peer, step.udp_out);
+    }
+    for (const std::vector<std::uint8_t>& datagram : step.udp_datagrams) {
+        if (!datagram.empty()) {
+            SendUdpBytes(sock, peer, datagram);
+        }
+    }
+}
+
 // Some client UDP packets arrive as raw [opcode][body], and some include a
 // two-byte total-length envelope before that payload. This mirrors the old
 // Python server's working UdpEnvelope path; strict [seq][opcode][body] remains
@@ -159,7 +172,6 @@ auto DecodeRawUdpPayload(const std::uint8_t* data, std::size_t len)
 
 auto TryLinkUdpFrame(Acceptor::Impl& impl, const proto::UdpFrame& frame, const sockaddr_in& from)
     -> bool {
-    bool linked = false;
     for (auto& [id, client] : impl.clients) {
         if (client.conn->UdpLinked()) {
             continue;
@@ -170,14 +182,23 @@ auto TryLinkUdpFrame(Acceptor::Impl& impl, const proto::UdpFrame& frame, const s
             client.udp_addr = from;
             client.udp_addr_known = true;
             SendBytes(client.sock, step.tcp_out);
+            SendStepUdp(impl.udp_sock, from, step);
             WFH_DEBUG("net", "linked UDP endpoint for session %llu opcode=0x%02X bytes=%zu",
                       static_cast<unsigned long long>(id), static_cast<unsigned>(frame.opcode),
                       frame.body.size());
-            linked = true;
-            break;  // linked exactly one session
+            return true;  // linked exactly one session
+        }
+        if (!step.udp_datagrams.empty() || !step.udp_out.empty()) {
+            // Pre-link UDP response (e.g. the D_HANDSHAKE stream setup arrives before
+            // the key echo links the endpoint). Answer to the source endpoint.
+            SendStepUdp(impl.udp_sock, from, step);
+            WFH_DEBUG("net", "session %llu pre-link UDP response opcode=0x%02X datagrams=%zu",
+                      static_cast<unsigned long long>(id), static_cast<unsigned>(frame.opcode),
+                      step.udp_datagrams.size());
+            return true;
         }
     }
-    return linked;
+    return false;
 }
 
 auto SameUdpEndpoint(const sockaddr_in& left, const sockaddr_in& right) -> bool {
@@ -201,7 +222,7 @@ auto TryRouteLinkedUdpFrame(Acceptor::Impl& impl, const proto::UdpFrame& frame,
     auto& [id, client] = *match;
     const auto step = client.conn->OnUdpPacket(frame.opcode, frame.body.data(), frame.body.size());
     SendBytes(client.sock, step.tcp_out);
-    SendUdpBytes(impl.udp_sock, from, step.udp_out);
+    SendStepUdp(impl.udp_sock, from, step);
     WFH_TRACE("net", "routed linked UDP session=%llu opcode=0x%02X bytes=%zu close=%d",
               static_cast<unsigned long long>(id), static_cast<unsigned>(frame.opcode),
               frame.body.size(), step.close ? 1 : 0);

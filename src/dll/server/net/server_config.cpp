@@ -87,6 +87,11 @@ void ApplyServerKey(ServerConfig& cfg, std::string_view line) {
         SetIfPresent(cfg.advertised_udp_host, ValueOf(line));
     } else if (KeyIs(line, "world_host")) {
         cfg.world_host = ParseBool(ValueOf(line), cfg.world_host);
+    } else if (KeyIs(line, "dev_port")) {
+        const std::uint32_t port = ParseU32(ValueOf(line), cfg.dev_port);
+        if (port <= kMaxPort) {
+            cfg.dev_port = static_cast<std::uint16_t>(port);
+        }
     }
 }
 

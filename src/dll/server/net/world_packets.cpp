@@ -53,8 +53,10 @@ constexpr std::int32_t kMaxPlayerId = 0x7fffffff;
 constexpr std::size_t kMaxSnapshotEntities = 255;
 constexpr std::uint32_t kMaskDefinition = 1U << 0U;
 constexpr std::uint32_t kMaskPosition = 1U << 1U;
+constexpr std::uint32_t kMaskRotation = 1U << 3U;
 constexpr std::uint32_t kMaskHealth = 1U << 5U;
-constexpr std::uint32_t kFullSnapshotMask = kMaskDefinition | kMaskPosition | kMaskHealth;
+constexpr std::uint32_t kFullSnapshotMask =
+    kMaskDefinition | kMaskPosition | kMaskRotation | kMaskHealth;
 constexpr unsigned kEntityMaskBits = 10;
 constexpr unsigned kBankSelectorBits = 16;
 constexpr unsigned kIdBits = 8;
@@ -420,6 +422,8 @@ auto RuntimeWorldBootstrapConfig() -> WorldBootstrapConfig {
 void WriteEntity(BitWriter& writer, const MvpEntitySnapshot& entity) {
     static const QuantConfig kPosConfig = MakeQuantConfig(
         QuantSpec{kVectorHeaderBits, kVectorTotalBits, kPositionMax, kPositionRange});
+    static const QuantConfig kRotConfig = MakeQuantConfig(
+        QuantSpec{kVectorHeaderBits, kVectorTotalBits, kRotationMax, kRotationRange});
     static const QuantConfig kStatConfig =
         MakeQuantConfig(QuantSpec{kStatsBits, kNoDynamicTotal, kUnitFloatMax, kUnitFloatRange});
 
@@ -437,7 +441,11 @@ void WriteEntity(BitWriter& writer, const MvpEntitySnapshot& entity) {
         writer.WriteBits(static_cast<std::uint32_t>(entity.cargo_unit_type), kIdBits);
     }
     writer.WriteBool(true);
+    // Field order follows the mask bit order (POS bit1, ROT bit3, HEALTH bit5). Rotation
+    // MUST be sent or map fixtures (repair pads/bases) render at a default orientation —
+    // i.e. "sideways". The reference marks loaded fixtures ROT-dirty, so it sends this too.
     WriteVec3(writer, entity.pos, kPosConfig);
+    WriteVec3(writer, entity.rot, kRotConfig);
     WriteQuantized(writer, entity.health, kStatConfig, 0);
 }
 
@@ -554,6 +562,20 @@ auto SessionPlayerId(std::uint64_t session_id) -> std::int32_t {
     return session_id <= static_cast<std::uint64_t>(kMaxPlayerId)
                ? static_cast<std::int32_t>(session_id)
                : kMaxPlayerId;
+}
+
+// TCP-framed UPDATE_STATS (0x1C) for broadcasting a team change to OTHER clients so
+// their rosters update (the requester gets the same record on UDP from its Connection).
+// Reuses the raw UDP body builder so the wire layout has a single source of truth, then
+// wraps it in the [u16 len][opcode][body] TCP frame.
+auto BuildUpdateStatsFramed(std::int32_t player_id, std::int32_t team)
+    -> std::vector<std::uint8_t> {
+    const auto raw = BuildUdpUpdateStats(player_id, team);  // [0x1C][body]
+    if (raw.empty()) {
+        return {};
+    }
+    const std::vector<std::uint8_t> body(raw.begin() + 1, raw.end());
+    return EncodeTcpFrame(raw.front(), body).value_or(std::vector<std::uint8_t>{});
 }
 
 }  // namespace
@@ -685,7 +707,10 @@ void MvpOnlineBridge::AddSession(const ClientCommand& cmd, bool& visibility_chan
     SessionState state;
     state.session_id = cmd.session_id;
     state.player_id = SessionPlayerId(cmd.session_id);
-    state.team = static_cast<std::int32_t>((sessions_.size() % 2U) + 1U);
+    // Join with NO team (0); the player selects one at team-select (team-switch
+    // reincarnate -> HandleTeamSwitch), matching the reference server. Pre-assigning
+    // disagrees with the engine's team-select and corrupts the roster display.
+    state.team = 0;
     state.name = cmd.text.empty() ? ("player" + std::to_string(state.player_id)) : cmd.text;
 
     const SessionState joined = state;
@@ -753,9 +778,22 @@ void MvpOnlineBridge::HandleTeamSwitch(SessionState& session, std::int32_t team)
         session.team = team;
         outbound_->Push(OutboundMessage{session.session_id, true,
                                         BuildReincarnateResult(kReincarnateTeamSwitchOk, "")});
-        WFH_DEBUG("mvp", "session %llu switched team=%d",
+        // Broadcast the team change to OTHER clients so their roster lists update (the
+        // requester already received UPDATE_STATS on UDP from its Connection; mirrors the
+        // reference server, which broadcasts UPDATE_STATS on a switch).
+        std::size_t peers = 0;
+        for (const auto& [id, peer] : sessions_) {
+            (void)peer;
+            if (id == session.session_id) {
+                continue;
+            }
+            outbound_->Push(
+                OutboundMessage{id, true, BuildUpdateStatsFramed(session.player_id, team)});
+            ++peers;
+        }
+        WFH_DEBUG("mvp", "session %llu switched team=%d (UPDATE_STATS to %zu peers)",
                   static_cast<unsigned long long>(session.session_id),
-                  static_cast<int>(session.team));
+                  static_cast<int>(session.team), peers);
         return;
     }
 
@@ -881,14 +919,20 @@ void MvpOnlineBridge::EmitRosterCatchup(const SessionState& joined) {
 }
 
 auto MvpOnlineBridge::EntitySnapshots() const -> std::vector<MvpEntitySnapshot> {
-    // M6.1: when the engine world provider is set it is the authoritative source —
-    // its entities REPLACE the MVP placeholder pads/session tanks entirely.
-    if (world_provider_) {
-        return world_provider_();
-    }
     std::vector<MvpEntitySnapshot> entities;
     entities.reserve(static_entities_.size() + sessions_.size());
+    // Map fixtures (pads/bases from the parsed `state`) are ALWAYS sent so the client
+    // can open the entry map / pick a spawn pad — the reference server sends this state
+    // every snapshot. The engine world-load populates terrain only, not these objects.
     entities.insert(entities.end(), static_entities_.begin(), static_entities_.end());
+    if (world_provider_) {
+        // M6.1: add the engine's authoritative dynamic entities (tanks/missiles) on top
+        // of the fixtures, rather than replacing them.
+        const std::vector<MvpEntitySnapshot> engine = world_provider_();
+        entities.insert(entities.end(), engine.begin(), engine.end());
+        return entities;
+    }
+    // MVP fallback (no engine world): session-projected tanks.
     for (const auto& [id, session] : sessions_) {
         (void)id;
         if (session.spawned) {

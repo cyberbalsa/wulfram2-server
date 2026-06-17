@@ -204,6 +204,167 @@ controller-reviewed steps** (the prior autonomous agent overran repeatedly; now 
       must become the source of truth for outbound snapshots; BEHAVIOR/TRANSLATION should
       ultimately come from engine/captured tables, not hard-coded Python defaults.
 
+### ⟳ M6 — real-time positions of all entities incl. players (in progress 2026-06-16)
+Goal: tanks move in real time for all clients. Client sends INPUTS only (confirmed in Ghidra:
+`ACTION_UPDATE 0x0A`/`ACTION_DUMP 0x09`, never position), so the server must SIMULATE. Decision (user):
+drive the BINARY's own vehicle physics per entity — NOT a ported sim ("use Ghidra, it's more true").
+Relay vehicle already exists: the per-tick snapshot carries every entity (incl. session tanks); they're
+just static because nothing updates their pos. Full RE map persisted in `memory/m6-tank-physics-drive-recipe.md`
+and `memory/m6-realtime-movement-relay.md`.
+
+Verified-in-Ghidra physics map (this session):
+- `0x46af90` is a NET/render hook (NOT physics — the Python port mislabels it).
+- Per-tank step = `Vehicle_UpdateThrustSimulation @0x4f9e20` `__thiscall(controller, paramObj)`, VIRTUAL
+  (Tank vtable 0x543128). It sets controller+0x48=paramObj, +0x4c=*(paramObj+4)=entity (health@entity+0xd0),
+  runs ComputeControlScalars/Thrust. Construct: `Tank_Construct @0x4f9a40` (__fastcall, 0x20B). Local-player
+  template: `TankClient_Construct @0x4902b0` → `VehicleInstance_InitForEntity`. Integrate:
+  `EntityPhysics_IntegrateStep @0x4f2890`. physObj @entity+0xbc; tuning table @physObj+0xc0; control-input
+  slots (turn1/forward2/strafe3) writable per-tank. Multi-tank-safe (per-object), EXCEPT the local-player
+  Sync sliders + the global world physics tick.
+
+**cdb live capture done + full recipe mapped (decision: full authentic controller).** Broke on a real driven
+local tank's `0x4f9e20` and captured ground truth (entity pos@+0x0c/rot@+0x30, physObj@entity+0xbc with
+pos@+0x10/rot@+0x1c, health@+0xd0; the step's `this`=Tank_Model[vtable 0x5430e8], `param`=Tank_Vehicle[0x543128],
+Tank_Vehicle+0x04=entity/+0x10=model). Traced the whole construction: the MODEL is looked up from a registry
+(`VehicleInstance_InitForEntity @0x4f63c0` → `VehicleModel_FindById(entity+8)`), NOT constructed — so the build
+is just: `new(0x20)` → `Tank_Construct @0x4f9a40` → `InitForEntity` → per tick write raw control at tuning
+`slot+0x10` (slot = `*(*(physObj+8)) + n*0x20`, n=1 turn/2 fwd/3 strafe, raw=input*`*(physObj+0xc)`) →
+`Vehicle_UpdateThrustSimulation @0x4f9e20` → integrate (`EntityPhysics_IntegrateStep @0x4f2890` or the global
+world tick) → `ReadEngineWorld` relays. FULL verified recipe in `memory/m6-tank-physics-drive-recipe.md`.
+
+**M6 Increment 1 DONE (cdb + live-validated):** added engine thunks `EngineTankConstruct`(Tank_Construct
+0x4f9a40, __fastcall) + `EngineVehicleInitForEntity`(0x4f63c0, __thiscall) and a `BuildDriveController`
+spike in `world_host_engine.cpp` that, after the test spawn, constructs a vehicle controller for the entity.
+Validation run logged `M6 drive controller built: vtable=0x543128 model=0x... (model!=0)` + no crash — so
+the headless server HAS the vehicle-model registry and `InitForEntity` resolves a model. The full graph is
+confirmed: entity(+0xbc physObj) ↔ Tank_Vehicle(0x543128) ↔ Tank_Model(0x5430e8/type-specific).
+
+**Dev live-poke console (tooling, replaces the rebuild/cdb loop):** localhost command socket (default port
+**6969**, `[server] dev_port`) — `src/dll/server/net/dev_console.cpp` + Python client `tools/dev_poke.py`.
+- Increment 1 (peek/poke/help) + Increment 2 (`call` + `bt`) are LIVE. `call <addr> <conv> [args]` runs on the
+  engine tick thread (marshaled via `PumpDevEngine` in `ServerTickBody`; universal x86 invoker
+  `EngineRawInvoke` in engine_thunks.cpp, ESP-frame-restore so convention-agnostic; SEH-guarded). `bt`
+  suspends the engine thread + EBP-walks (wulfram2+RVA). DLL side: `src/dll/server/dev_engine.cpp`.
+- Live-verified: `peek 0x4f9e20 16`→`8b 44 24 04 …`; `world` decodes the engine entity; `bt`→`wulfram2+0x18f7b`;
+  `call 0x4f9e20 thiscall <model> <tankVehicle>`→`ok eax=…`, no crash. 109/109 CTest, lint PASS.
+- **2b (next):** `bp`/`bc`/`hook` via VEH int3 (log-mode trace breakpoints + callstack capture).
+
+**M6 live-drive findings (via the dev console):** constructed a vehicle controller for the test entity and
+drove it live. Input → control-scalar WORKS: poking the forward slot (`*(TankVehicle+0x08)`→base`+0x50`,
+value = float/divisor; divisor=50) then `call 0x4f9e20` set `model+0x70` (forward scalar) = 1.0. `call`
+`EntityPhysics_IntegrateStep@0x4f2890` runs clean. **BLOCKER:** thrust = 0 — the vehicle tuning table is
+entirely zero (slots 6/7 throttle/thrust = 0). ROOT CAUSE (user's framing): the headless engine **booted a
+world but never joined a server**, so the on-join client state a server pushes — vehicle tuning (BEHAVIOR),
+TRANSLATION tables, etc. — is unset; the server only *builds* `BuildBehavior` to SEND, never feeds it to its
+own engine. Authentic fix = run the server's own on-join data through the engine's **client-side handlers**:
+`Net_HandleBehavior @ 0x46dc00` (loads physics globals + `VehicleInfo_LoadGlobalState` +
+`VehicleModel_ForEachLoadResources` = the tuning). It takes an engine **MemBuff**, so wrap the BEHAVIOR body
++ call it (same for TRANSLATION 0x32). Then thrust → integrate → motion.
+
+### ✅ M6.2-min(a) — on-join self-load: BEHAVIOR fed through the engine's client handler (2026-06-17)
+The headless engine now loads its own vehicle physics tuning at bootstrap by feeding the server's
+own BEHAVIOR through the engine's **client-side** handler — exactly as a joined client would. The
+engine booted a world but never "joined", so its tuning globals were unset (the diagnosed thrust=0
+root cause). **Built, live-validated via the dev console, wired into the world-host bootstrap, and
+re-verified end-to-end on a fresh injected session.**
+- **Full RE of the MemBuff construction** (the crux): `Net_HandleBehavior @ 0x46dc00` is
+  `__cdecl(p1,p2,packet)` (p1/p2 unused); `packet` is an engine **MemBuff** (hunk-list bit-stream,
+  MSB-first — matches our `BitWriter`). Mirrored the engine's OWN receive path
+  `Net_ProcessOrderedReceiveQueue @ 0x504a2c`: `_malloc(0x20)` struct + `_malloc(len)` body (copy in)
+  → `BitBuf_ConstructWithChunk(membuf, mode=1, body, len, owner=0)` (`__thiscall` ECX=membuf, `RET 0x10`)
+  → `Net_HandleBehavior(0,0,membuf)` → `MemBuff_FreeAllHunks(membuf)` + `_free(membuf)`. VAs: `_malloc`
+  `0x50c8eb`, `_free` `0x50c292`, `BitBuf_ConstructWithChunk` `0x508a50`, `MemBuff_FreeAllHunks`
+  `0x509a30`. Body buffers MUST be engine-`_malloc`'d (the engine frees them). All calls go through
+  the existing `SafeEngineInvoke` (convention-agnostic, SEH-guarded).
+- **HEADLESS-SAFE confirmed** (RE + live): `VehicleModel_ForEachLoadResources @ 0x4e9630` is pure
+  stream-deserialize + heap (zero graphics/file I/O). BEHAVIOR's only side effect is
+  `Net_FlushSendBuffer(packet)` on the packet itself, so **no live connection needed**. (TRANSLATION
+  `0x32`/`Net_HandleTranslationTable @ 0x46e980` is NOT wired: it sends a `0x33` ACK via
+  `DAT_006782e4` which needs a live send object, AND it is not required — our C++ relay does its own
+  quantization; the engine's `DAT_00678134` codebook is unused by us.)
+- **Verified live** (`tools/feed_onjoin_probe.py`): `0x679170` scalar block 6→25 non-zero bytes (11
+  header floats 0.0→1.0); Tank model config doubles loaded — hover height **3.25 (default) → 9.75**
+  (= our `kTankHoverHeight`), proving OUR BEHAVIOR deserialized into the model. After wiring: the
+  fresh session logs `on-join BEHAVIOR fed to engine (body=3563 bytes, faulted=0)` at bootstrap.
+  Build = **109/109 CTest**, `lint.ps1` = **PASS**.
+- Code: `FeedBehaviorToEngine()` in `world_host_engine.cpp` (one-shot after bootstrap, before the
+  relay/controller). New dev tools: `tools/feed_onjoin_probe.py`, `tools/drive_probe.py`; a DISABLED
+  gtest `BringupPackets.DISABLED_DumpOnJoinBodies` dumps the body bytes for the live probe.
+
+**DRIVE BLOCKER precisely scoped (next increment, M6.2-min(b)):** the on-join load is necessary but
+NOT sufficient to drive a non-local server tank. Live drive of the test entity (post-BEHAVIOR) still
+produced no motion. Ground-truth thrust math (decompiled this session):
+- `Vehicle_UpdateThrustSimulation @ 0x4f9e20` gates on `entity+0xd0 (health) != 0` (ok) AND
+  `TankVehicle+0x18 != 0` — and `Vehicle_UpdateThrustFx @ 0x4f9700` sets `TankVehicle+0x18` from
+  **tuning slot5** (`base+0xB8`, thrust-intensity). It reads 0 → gate fails → `ApplyThrustForces` skipped.
+- `Vehicle_ApplyThrustForces @ 0x4f9b10`: `forward_force = model+0x58 * move_adjust(model+0x18, loaded
+  ✓) * fwd_scalar(model+0x70)`. It uses **model+0x58/+0x5c** (thrust magnitudes, source still
+  unknown — NOT set by the load, ComputeControlScalars, or UpdateThrustFx) + the loaded config doubles
+  + input scalars. It does **NOT** read the old "slots 6/7" (+0x68/+0x6c) — that framing was a red
+  herring.
+- ROOT BLOCKER: the **per-vehicle tuning SLOT TABLE** at `*(*(0x67cd58))` (and `*(*(physObj+8))`) is
+  entirely zero — it is the LOCAL-PLAYER's table, never populated for a non-local server entity.
+  Driving authentically needs each server tank to own a populated slot table (the "full authentic
+  controller" path). Input path itself WORKS: write `input*divisor` (divisor = **int 50** at
+  `TankVehicle+0xc`, not a float) to slot2 scaled-read `base+0x50` → `ComputeControlScalars` sets
+  `model+0x70` (forward scalar) = 1.0 (live-confirmed).
+- **Next:** populate a per-tank slot table (and find the model+0x58/+0x5c source) so thrust applies →
+  confirm motion → then route `0x0A`/`0x09` ACTION inputs per-session → per-player. See
+  `memory/m6-tank-physics-drive-recipe`.
+
+### ✅ M5.3 — team-select → entry-map → SPAWN works end-to-end; +2 follow-up fixes (2026-06-16)
+**Milestone: a real client can now pick a team, open the entry map, choose a repair pad, and spawn.**
+The blocker was a missing `UPDATE_STATS (0x1C)` on team switch — decoded from the user's own working
+Python capture (`Wulf-Forge/logs/server-test.out.log`): the working server replies to a team-switch
+`0x25` with **3 UDP packets** `D_ACK(0x02) → UPDATE_STATS(0x1C) → REINCARNATE(0x25 code 17)`; mine sent
+only ack + the code-17 confirm, so the client showed "you changed teams" but the roster list never
+updated and the Entry-Map/Respawn selector stayed disabled. Now `Connection::HandleUdpReincarnateRequest`
+emits `BuildUdpUpdateStats(pid, team)` on UDP (byte-exact: `1C 00000004 00000006 0002 0021 0003 0005
+0009 00010000 00010000 0000000A`). TDD: `BringupPackets.UdpUpdateStats…`, `Connection.InGameUdpTeamSwitch…`.
+
+Two follow-up fixes after the user drove a live spawn (investigated with the Python source AND a Ghidra
+client decompile, per the user):
+- **Sideways repair pad → fixed.** Root cause: `WriteEntity` (the `VIEW_UPDATE 0x0F` snapshot) wrote
+  `DEF|POS|HEALTH` but **never rotation**, so map fixtures arrived with no orientation and rendered at a
+  default heading. The reference marks loaded fixtures ROT-dirty and sends rotation. Added `kMaskRotation`
+  (bit 3) + `WriteVec3(rot, kRotConfig)` (COMPRESSOR_ROT max 6.3/range 12.6) in mask-bit order
+  (POS→ROT→HEALTH). Confirmed against client `Net_HandleTankSpawn @0x46D260` (rot stored at entity
+  `+0x30/+0x34/+0x38`). TDD: `ViewUpdateSnapshotIncludesRotationSoFixturesAreNotSideways`.
+- **Team switch now broadcast to other clients.** `MvpOnlineBridge::HandleTeamSwitch` broadcasts a
+  TCP-framed `UPDATE_STATS (0x1C)` to every OTHER session (the requester already got it on UDP), so peers'
+  rosters update. TDD: `MvpOnlineBridge.TeamSwitchBroadcastsUpdateStatsToOtherClients`. 101/101 CTest, lint PASS.
+
+**Open (M6 — real-time movement relay):** moving tank positions are not yet relayed. Reference flow
+(confirmed Python + Ghidra): client sends control INPUTS `ACTION_DUMP 0x09` / `ACTION_UPDATE 0x0A`
+(`Net_SendActionUpdate @0x46C860`); server simulates @10 Hz and broadcasts `UPDATE_ARRAY 0x0E` to others
+(self gets `VIEW_UPDATE 0x0F`), bit-packed with a 4-bit priority header + 13–16-bit quantized pos/vel/rot
+and a 10-bit update mask (`Net_ApplyWorldSnapshot @0x47D760`). Per `m5-direct-world-host`, source positions
+from the engine world rather than a Python-style sim.
+
+### ✅ M5.2 — UDP reliable-stream handshake + full client-opcode whitelist (2026-06-16)
+The crux that blocked team-select/spawn on real clients. **Root cause (live evidence):** the client
+spams `0x03` (D_HANDSHAKE, 199-byte "Beacon Stream"/"Squad Things" stream defs, incrementing timestamp)
+right after WANT_UPDATES, but the server **never answered** — so the client's gameplay streams stayed
+paused and the entry-map/team-select never activated. Two layered causes, both fixed:
+- **`0x03`/`0x0B` were silently dropped at the UDP gate.** `IsKnownOpcode` only listed 23 opcodes;
+  `TryRouteLinkedUdpFrame` rejects any non-whitelisted opcode (`UDP packet ignored; no matching pending
+  session`). Per user request ("have a handler for all opcodes … in the whitelist") the `Opcode` enum +
+  `kKnown` now list **every** client-emitted opcode (35): added DebugString 0x00, Ack 0x02, DHandshake
+  0x03, ActionDump 0x09, ActionUpdate 0x0A, ClientPing 0x0B, UdpPing 0x0C, ChatComm 0x20, DropRequest
+  0x2B, Viewpoint 0x35, BeaconRequest 0x3A, Kudos 0x4F. Unknown opcodes a connection doesn't act on are
+  accepted + no-op'd (logged via `LogUdpPacket`), not dropped. TDD: `ProtoValidate.KnownOpcodes` updated.
+- **Server now answers the handshake** (matches the Python "Unpause Streams (Critical for the client to
+  accept data)" path). `OnUdpPacket(0x03)` → `EmitUdpStreamHandshake`: emits 4 datagrams — `0x02` ack
+  (6B) + `0x03` stream defs for 4 streams (128B) + `0x04` unpause stream 1 + unpause stream 3 (4B each).
+  `OnUdpPacket(0x0B)` → `0x0C` pong. `StepResult` gained `udp_datagrams`; acceptor `SendStepUdp` flushes
+  them (linked **and** pre-link). TDD: 4 `UdpHandshake.*` builder tests. 98/98 CTest, lint PASS.
+
+**Live two-client smoke (this run):** server `:2627`, world `bpass` loaded (`entities=34`); both admin
+clients connected (sessions 2,3), logged in, `WANT_UPDATES → InGame`, sent `0x03` **once**, server
+logged `UDP stream handshake queued (ack+defs+unpause 1,3) pid=2/3` + the 6/128/4/4 datagrams, and the
+client **stopped re-spamming `0x03`** (advanced to steady `0x33` heartbeat + receiving `entities=34`
+snapshots). No SEH/crash. **Open:** user-driven team-select (`0x25` mode 1) → repair-pad spawn.
+
 ### ✅ M5.1e — entry-map render fix + self-connection re-seam (2026-06-16)
 Two evidenced fixes after a live rendering-client smoke + full Ghidra RE of the handshake (see
 `memory/m4-tick-seam-render-gated.md`):

@@ -1,5 +1,8 @@
 #include "server/engine_thunks.hpp"
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>  // EXCEPTION_EXECUTE_HANDLER for the SEH-guarded invoker
+
 namespace wfh::server {
 
 // __declspec(naked): emit no compiler prologue/epilogue and (critically) no /RTC1
@@ -98,6 +101,93 @@ __declspec(naked) void EngineObjInitFromSpawn(void*, float, float, float, float,
         pop  ebp
         ret
     }
+}
+
+// Tank_Construct @ 0x4f9a40 — __fastcall(ECX = controller). 0 stack args; returns the
+// controller in EAX (it preserves ESI internally). `mov esp,ebp` is a safety net.
+// Frame: [ebp+0x08] controller
+// NOLINTNEXTLINE(readability-named-parameter,hicpp-named-parameter)
+__declspec(naked) auto EngineTankConstruct(void*) -> void* {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        mov  ecx, [ebp+0x08]  // controller -> ECX
+        mov  eax, 4f9a40h  // Tank_Construct -> controller in EAX
+        call eax
+        mov  esp, ebp
+        pop  ebp
+        ret
+    }
+}
+
+// VehicleInstance_InitForEntity @ 0x4f63c0 — __thiscall(ECX = controller; stack args
+// param_1=entity, param_2). __thiscall pushes right-to-left (param_2 first) and the callee
+// cleans the 8 bytes; `mov esp,ebp` restores ESP regardless (belt-and-suspenders).
+// Frame: [ebp+0x08] controller [ebp+0x0c] entity [ebp+0x10] param2
+// NOLINTNEXTLINE(readability-named-parameter,hicpp-named-parameter)
+__declspec(naked) void EngineVehicleInitForEntity(void*, void*, void*) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        mov  eax, [ebp+0x10]  // param2 (pushed first)
+        push eax
+        mov  eax, [ebp+0x0c]  // entity (pushed last)
+        push eax
+        mov  ecx, [ebp+0x08]  // controller -> ECX
+        mov  eax, 4f63c0h  // VehicleInstance_InitForEntity (callee-clean 8)
+        call eax
+        mov  esp, ebp
+        pop  ebp
+        ret
+    }
+}
+
+// Universal x86 invoker. Frame after `push ebp; mov ebp,esp`:
+//   [ebp+0x08] addr  [ebp+0x0c] ecx  [ebp+0x10] edx  [ebp+0x14] args  [ebp+0x18] argc
+// Pushes args right-to-left, sets ECX/EDX, calls addr; then `lea esp,[ebp-8]` discards the
+// pushed args AND any callee-side cleanup difference, so it is convention-agnostic. EAX
+// (the return value) is never touched by the epilogue.
+// NOLINTNEXTLINE(readability-named-parameter,hicpp-named-parameter)
+__declspec(naked) auto EngineRawInvoke(std::uint32_t, std::uint32_t, std::uint32_t,
+                                       const std::uint32_t*, int) -> std::uint32_t {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        push esi
+        push edi
+        mov  esi, [ebp+0x14]  // args ptr
+        mov  edi, [ebp+0x18]  // argc
+        test edi, edi
+        jz   skip_args
+        lea  esi, [esi + edi*4 - 4]  // &args[argc-1]
+    push_loop:
+        push dword ptr [esi]  // push args right-to-left
+        sub  esi, 4
+        dec  edi
+        jnz  push_loop
+    skip_args:
+        mov  ecx, [ebp+0x0c]  // ECX (this / fastcall arg0)
+        mov  edx, [ebp+0x10]  // EDX (fastcall arg1)
+        mov  eax, [ebp+0x08]  // target
+        call eax  // result in EAX
+        lea  esp, [ebp-8]  // drop pushed args (+ any callee-clean diff); esp -> edi slot
+        pop  edi
+        pop  esi
+        pop  ebp
+        ret
+    }
+}
+
+// SEH wrapper. Kept C-like (InvokeResult is trivially destructible) so MSVC accepts __try.
+auto SafeEngineInvoke(std::uint32_t addr, std::uint32_t ecx, std::uint32_t edx,
+                      const std::uint32_t* args, int argc) -> InvokeResult {
+    InvokeResult result;
+    __try {
+        result.eax = EngineRawInvoke(addr, ecx, edx, args, argc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        result.faulted = true;
+    }
+    return result;
 }
 
 }  // namespace wfh::server

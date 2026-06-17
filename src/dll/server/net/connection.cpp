@@ -34,11 +34,21 @@ constexpr std::uint8_t kUdpAckOpcode = 0x02;
 constexpr std::uint8_t kUdpAckSubcmd = 0x01;
 constexpr std::uint16_t kUdpAckLength = 9;
 
+// UDP reliable-stream handshake the client requires to enable gameplay streams.
+constexpr std::uint8_t kUdpDHandshakeOpcode = 0x03;  // client D_HANDSHAKE
+constexpr std::uint8_t kUdpPingOpcode = 0x0B;        // client ping -> we reply 0x0C pong
+constexpr std::uint8_t kReliableStreamId = 1;        // stream we unpause (events/chat)
+constexpr std::uint8_t kGameDataStreamId = 3;        // stream we unpause (movement/state)
+
 // LOGIN_STATUS (0x22) codes: 1 = ask for password, 8 = login OK.
 constexpr std::uint8_t kLoginStatusAskPassword = 1;
 constexpr std::uint8_t kLoginStatusOk = 8;
 
-constexpr std::int32_t kDefaultTeam = 1;
+// A joining player has NO team until they pick one at the team-select screen (the
+// reference server joins with team 0 and the client then sends a team-switch
+// reincarnate). Pre-assigning a team here disagrees with the engine's team-select
+// and shows the player on the wrong/both teams.
+constexpr std::int32_t kJoinTeamUnassigned = 0;
 
 // Append framed bytes onto an output buffer.
 void Append(std::vector<std::uint8_t>& out, const std::vector<std::uint8_t>& frame) {
@@ -138,6 +148,25 @@ auto DefaultPlayerId(std::uint64_t session_id) -> std::int32_t {
     constexpr auto kMaxId = static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
     return session_id <= kMaxId ? static_cast<std::int32_t>(session_id)
                                 : std::numeric_limits<std::int32_t>::max();
+}
+
+// Answer the client's D_HANDSHAKE (0x03): ack + the 4 stream definitions + unpause the
+// reliable + game-data streams. Without these the client's gameplay streams stay paused,
+// so it never accepts world/team data or sends team-select/spawn. Matches the reference
+// server's on_d_handshake. ticks are informational (0 is fine).
+void EmitUdpStreamHandshake(std::int32_t player_id, std::uint64_t session_id, StepResult& out) {
+    out.udp_datagrams.push_back(BuildUdpHandshakeAck(0));
+    out.udp_datagrams.push_back(BuildUdpStreamDefs(0, player_id));
+    out.udp_datagrams.push_back(BuildUdpStreamUnpause(kReliableStreamId));
+    out.udp_datagrams.push_back(BuildUdpStreamUnpause(kGameDataStreamId));
+    WFH_DEBUG("conn", "session %llu UDP stream handshake queued (ack+defs+unpause 1,3) pid=%d",
+              static_cast<unsigned long long>(session_id), static_cast<int>(player_id));
+}
+
+// Reply to a client ping (0x0B) with a pong (0x0C) echoing the client's timestamp.
+void EmitUdpPong(const std::uint8_t* body, std::size_t len, StepResult& out) {
+    BitReader reader(body, len);
+    out.udp_datagrams.push_back(BuildUdpPong(reader.ReadI32().value_or(0)));
 }
 
 struct UdpKeyEcho {
@@ -256,13 +285,24 @@ auto Connection::OnUdpPacket(std::uint8_t opcode, const std::uint8_t* body, std:
         return result;
     }
     LogUdpPacket(session_id_, opcode, len, state_);
+    // The reliable-UDP stream handshake can arrive before the key-echo links the
+    // endpoint; answer it regardless of state so the client's gameplay streams come up.
+    if (opcode == kUdpDHandshakeOpcode) {
+        const std::int32_t pid = player_id_ >= 0 ? player_id_ : DefaultPlayerId(session_id_);
+        EmitUdpStreamHandshake(pid, session_id_, result);
+        return result;
+    }
+    if (opcode == kUdpPingOpcode) {
+        EmitUdpPong(body, len, result);
+        return result;
+    }
     if (opcode == static_cast<std::uint8_t>(Opcode::Reincarnate)) {
         if (state_ != ConnState::InGame) {
             WFH_TRACE("conn", "session %llu ignored UDP reincarnate before InGame",
                       static_cast<unsigned long long>(session_id_));
             return result;
         }
-        if (!HandleUdpReincarnateRequest(body, len, result.udp_out)) {
+        if (!HandleUdpReincarnateRequest(body, len, result)) {
             result.close = true;
         }
         return result;
@@ -464,7 +504,7 @@ auto Connection::HandleReincarnateRequest(const std::uint8_t* body, std::size_t 
 }
 
 auto Connection::HandleUdpReincarnateRequest(const std::uint8_t* body, std::size_t len,
-                                             std::vector<std::uint8_t>& udp_out) -> bool {
+                                             StepResult& out) -> bool {
     const auto request = ReadReincarnateRequest(body, len);
     if (!request) {
         WFH_DEBUG("conn", "session %llu rejected malformed UDP reincarnate request",
@@ -479,12 +519,26 @@ auto Connection::HandleUdpReincarnateRequest(const std::uint8_t* body, std::size
         return false;
     }
 
-    udp_out =
+    out.udp_out =
         BuildUdpAck(UdpAckSpec{static_cast<std::uint8_t>(Opcode::Reincarnate), request->sequence});
     WFH_TRACE("conn", "session %llu queued UDP ack opcode=0x%02X seq=%u bytes=%zu",
               static_cast<unsigned long long>(session_id_),
               static_cast<unsigned>(Opcode::Reincarnate), static_cast<unsigned>(request->sequence),
-              udp_out.size());
+              out.udp_out.size());
+
+    if (request->is_team_switch) {
+        // Mirror the reference team-switch reply: push the UPDATE_STATS (0x1C) record on
+        // UDP to the requester. This is what makes the client refresh its roster list and
+        // ACTIVATE the entry-map / respawn selector (the code-17 REINCARNATE confirm the
+        // client already gets shows "you changed teams", but the list/selector stay inert
+        // until this record arrives). The world bridge still records the team for spawn
+        // validation from the queued command above.
+        const std::int32_t pid = player_id_ >= 0 ? player_id_ : DefaultPlayerId(session_id_);
+        out.udp_datagrams.push_back(BuildUdpUpdateStats(pid, request->team_id));
+        WFH_DEBUG("conn", "session %llu team-switch UPDATE_STATS queued team=%d pid=%d",
+                  static_cast<unsigned long long>(session_id_), static_cast<int>(request->team_id),
+                  static_cast<int>(pid));
+    }
     return true;
 }
 
@@ -611,7 +665,7 @@ void Connection::EmitBringup(std::vector<std::uint8_t>& out) {
     Append(out, BuildMotd("Wulf Forge Headless"));
     Append(out, BuildBehavior());
     Append(out, BuildTranslation());
-    Append(out, BuildAddToRoster(pid, kDefaultTeam, username_, ""));
+    Append(out, BuildAddToRoster(pid, kJoinTeamUnassigned, username_, ""));
     Append(out, BuildWorldStats(cfg_.map));
     WFH_DEBUG("conn", "session %llu emitted bringup pid=%d bytes=%zu",
               static_cast<unsigned long long>(session_id_), static_cast<int>(pid), out.size());

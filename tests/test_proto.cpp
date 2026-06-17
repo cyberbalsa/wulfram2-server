@@ -293,9 +293,17 @@ TEST(ProtoValidate, KnownOpcodes) {
     EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x18U));  // TankSpawn
     EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x0EU));  // UpdateArray
     EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x4DU));  // IdentifiedUdp
-    EXPECT_FALSE(wfh::proto::IsKnownOpcode(0x00U));
+    // Every opcode the client can emit is whitelisted so none is silently dropped at
+    // the UDP/TCP gate — including the low-numbered control/handshake set.
+    EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x00U));  // DebugString
+    EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x03U));  // DHandshake (reliable-stream setup)
+    EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x0BU));  // ClientPing
+    EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x0AU));  // ActionUpdate
+    EXPECT_TRUE(wfh::proto::IsKnownOpcode(0x33U));  // TranslationAck
+    // Values outside the protocol set are still rejected.
     EXPECT_FALSE(wfh::proto::IsKnownOpcode(0xFFU));
     EXPECT_FALSE(wfh::proto::IsKnownOpcode(0x99U));
+    EXPECT_FALSE(wfh::proto::IsKnownOpcode(0x01U));
 }
 
 TEST(ProtoValidate, ClampUnit) {

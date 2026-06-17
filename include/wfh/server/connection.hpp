@@ -35,8 +35,12 @@ enum class ConnState : int {
 // What a connection wants the socket layer to do after a step.
 struct StepResult {
     std::vector<std::uint8_t> tcp_out;  // bytes to send on TCP (already framed)
-    std::vector<std::uint8_t> udp_out;  // bytes to send to the linked UDP endpoint
-    bool close = false;                 // drop the connection (violation/flood)
+    std::vector<std::uint8_t> udp_out;  // single UDP datagram to the source endpoint
+    // Multiple discrete UDP datagrams to the source endpoint, sent in order (each is
+    // one datagram). Used by the reliable-stream handshake (0x02 ack + 0x03 defs +
+    // 0x04 unpause x2) where the client expects separate packets.
+    std::vector<std::vector<std::uint8_t>> udp_datagrams;
+    bool close = false;  // drop the connection (violation/flood)
 };
 
 // Flood/sanity caps applied per connection. Conservative; a 2006 client stays well
@@ -106,7 +110,7 @@ private:
                                         std::vector<std::uint8_t>& out) const -> bool;
     [[nodiscard]] auto HandleReincarnateRequest(const std::uint8_t* body, std::size_t len) -> bool;
     [[nodiscard]] auto HandleUdpReincarnateRequest(const std::uint8_t* body, std::size_t len,
-                                                   std::vector<std::uint8_t>& udp_out) -> bool;
+                                                   StepResult& out) -> bool;
     [[nodiscard]] auto QueueTeamReincarnate(std::int32_t team_id) -> bool;
     [[nodiscard]] auto QueueSpawnReincarnate(std::int32_t selected_entry_id, std::int32_t base_id)
         -> bool;

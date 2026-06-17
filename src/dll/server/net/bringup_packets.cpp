@@ -4,7 +4,9 @@
 #include "wfh/proto/framing.hpp"
 #include "wfh/proto/opcodes.hpp"
 
+#include <array>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace wfh::server {
@@ -27,6 +29,28 @@ constexpr std::uint8_t kHelloVersion = 0x00;
 constexpr std::uint8_t kHelloUdpConfig = 0x01;
 constexpr std::uint8_t kHelloSessionKey = 0x02;
 constexpr std::uint8_t kHelloVerified = 0x03;
+
+// UDP reliable-stream handshake opcodes/values (server->client raw datagrams).
+constexpr std::uint8_t kUdpAckOpcode = 0x02;            // ACK (subcmd-multiplexed)
+constexpr std::uint8_t kUdpAckSubcmdHandshake = 0x00;   // subcmd 0 = handshake ack
+constexpr std::uint8_t kUdpHandshakeOpcode = 0x03;      // D_HANDSHAKE stream defs
+constexpr std::uint8_t kUdpStreamControlOpcode = 0x04;  // stream control (unpause)
+constexpr std::uint8_t kUdpPongOpcode = 0x0C;           // ping reply
+constexpr std::int32_t kUdpStreamCount = 4;             // Unreliable/Reliable/Stream2/GameData
+constexpr std::int32_t kUdpStreamIdCount = 1;           // one id per stream
+constexpr std::int32_t kUdpStreamPriority = 1;          // per-stream priority
+constexpr std::uint16_t kUdpStreamUnpauseSeq = 1;       // initial stream sequence
+
+// UPDATE_STATS (0x1C) team-switch record constants (from the reference capture). The
+// non-team fields are fixed values the client expects; only player_id + team vary.
+constexpr std::uint8_t kUdpUpdateStatsOpcode = 0x1C;
+constexpr std::int32_t kUpdateStatsRecordKind = 6;
+constexpr std::uint16_t kUpdateStatsFieldMask = 33;
+constexpr std::uint16_t kUpdateStatsFieldA = 3;
+constexpr std::uint16_t kUpdateStatsFieldB = 5;
+constexpr std::uint16_t kUpdateStatsFieldC = 9;
+constexpr double kUpdateStatsUnitFraction = 1.0;
+constexpr std::int32_t kUpdateStatsTrailingFlags = 10;
 
 }  // namespace
 
@@ -149,6 +173,68 @@ auto BuildAddToRoster(std::int32_t account_id, std::int32_t team, std::string_vi
     writer.WriteFixed1616(0.0);  // score
     writer.WriteI32(0);          // flags
     return Frame(Opcode::AddToRoster, writer);
+}
+
+auto BuildUdpHandshakeAck(std::int32_t ticks) -> std::vector<std::uint8_t> {
+    BitWriter writer;
+    writer.WriteByte(kUdpAckOpcode);
+    writer.WriteByte(kUdpAckSubcmdHandshake);
+    writer.WriteI32(ticks);
+    return writer.Bytes();
+}
+
+auto BuildUdpStreamDefs(std::int32_t ticks, std::int32_t player_id) -> std::vector<std::uint8_t> {
+    static constexpr std::array<std::string_view, kUdpStreamCount> kStreamNames = {
+        "Unreliable", "Reliable", "Stream 2", "Game Data"};
+    BitWriter writer;
+    writer.WriteByte(kUdpHandshakeOpcode);
+    writer.WriteI32(ticks);
+    writer.WriteI32(player_id);
+    writer.WriteI32(kUdpStreamCount);
+    for (std::int32_t i = 0; i < kUdpStreamCount; ++i) {
+        writer.WriteString(kStreamNames.at(static_cast<std::size_t>(i)));
+        writer.WriteI32(kUdpStreamIdCount);
+        writer.WriteI32(i);  // stream id
+    }
+    writer.WriteI32(kUdpStreamCount);  // config count
+    for (std::int32_t i = 0; i < kUdpStreamCount; ++i) {
+        writer.WriteI32(i);  // stream id
+        writer.WriteI32(kUdpStreamPriority);
+    }
+    return writer.Bytes();
+}
+
+auto BuildUdpStreamUnpause(std::uint8_t stream_id) -> std::vector<std::uint8_t> {
+    BitWriter writer;
+    writer.WriteByte(kUdpStreamControlOpcode);
+    writer.WriteByte(stream_id);
+    writer.WriteU16(kUdpStreamUnpauseSeq);
+    return writer.Bytes();
+}
+
+auto BuildUdpPong(std::int32_t echoed_timestamp) -> std::vector<std::uint8_t> {
+    BitWriter writer;
+    writer.WriteByte(kUdpPongOpcode);
+    writer.WriteI32(echoed_timestamp);
+    return writer.Bytes();
+}
+
+// player_id/team are distinct wire fields; the convertible-pair swap check does not apply.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+auto BuildUdpUpdateStats(std::int32_t player_id, std::int32_t team) -> std::vector<std::uint8_t> {
+    BitWriter writer;
+    writer.WriteByte(kUdpUpdateStatsOpcode);
+    writer.WriteI32(player_id);
+    writer.WriteI32(kUpdateStatsRecordKind);
+    writer.WriteU16(static_cast<std::uint16_t>(team));
+    writer.WriteU16(kUpdateStatsFieldMask);
+    writer.WriteU16(kUpdateStatsFieldA);
+    writer.WriteU16(kUpdateStatsFieldB);
+    writer.WriteU16(kUpdateStatsFieldC);
+    writer.WriteFixed1616(kUpdateStatsUnitFraction);
+    writer.WriteFixed1616(kUpdateStatsUnitFraction);
+    writer.WriteI32(kUpdateStatsTrailingFlags);
+    return writer.Bytes();
 }
 
 }  // namespace wfh::server

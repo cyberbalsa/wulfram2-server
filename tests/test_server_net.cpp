@@ -8,6 +8,7 @@
 #include "wfh/server/acceptor.hpp"
 #include "wfh/server/bringup_packets.hpp"
 #include "wfh/server/connection.hpp"
+#include "wfh/server/dev_console.hpp"
 #include "wfh/server/queues.hpp"
 #include "wfh/server/runtime.hpp"
 #include "wfh/server/server_config.hpp"
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <thread>
@@ -405,38 +407,64 @@ TEST(BringupPackets, ViewUpdateSnapshotCarriesTwoTankDefinitions) {
 
     EXPECT_EQ(r.ReadI32().value(), 1);  // first entity id
     EXPECT_TRUE(r.ReadBool().value());
-    EXPECT_EQ(r.ReadBits(10).value(), 0x023u);  // DEF | POS | HEALTH
+    EXPECT_EQ(r.ReadBits(10).value(), 0x02Bu);  // DEF | POS | ROT | HEALTH
     EXPECT_EQ(r.ReadBits(16).value(), 0u);      // bank selector
     EXPECT_EQ(r.ReadBits(8).value(), 0u);       // unit type
     EXPECT_EQ(r.ReadBits(8).value(), 1u);       // team
 }
 
-TEST(BringupPackets, ViewUpdateSnapshotMatchesPythonEntityWireLayout) {
+TEST(BringupPackets, ViewUpdateSnapshotIncludesRotationSoFixturesAreNotSideways) {
+    // Map fixtures (repair pads/bases) carry an orientation; the snapshot MUST declare
+    // and send ROT (mask bit 3) per entity or the client renders them at a default
+    // orientation ("sideways"). Decoding through the per-mask reader also proves the
+    // rotation vec3 is laid out where the client expects it (POS, then ROT, then HEALTH).
     std::vector<MvpEntitySnapshot> entities;
-    entities.push_back(MvpEntitySnapshot{1, 0, 1, true, {100.0F, 100.0F, 100.0F}});
-    entities.push_back(MvpEntitySnapshot{2, 0, 2, true, {140.0F, 100.0F, 100.0F}});
+    MvpEntitySnapshot pad{};
+    pad.net_id = 9;
+    pad.unit_type = 0;
+    pad.team = 1;
+    pad.is_manned = false;
+    pad.pos = {5150.0F, 5241.0F, 7.7F};
+    pad.rot = {0.16F, 0.13F, 4.65F};  // non-trivial heading (radians), like a real pad
+    entities.push_back(pad);
 
     const auto bytes = BuildViewUpdateSnapshot(123, entities, 1.0F, 1.0F);
     const Frame f = FirstFrame(bytes);
-    ASSERT_EQ(f.opcode, static_cast<std::uint8_t>(Opcode::ViewUpdate));
-    ASSERT_GE(f.body.size(), 8u);
+    const auto decoded = DecodeEntitiesInViewUpdate(f);
 
-    // Reference suffix from ../Wulf-Forge's Python UpdateArrayPacket serializer:
-    // [has-local-stats..entities]. The first 8 bytes are timestamp+sequence and
-    // are intentionally ignored here.
-    const std::vector<std::uint8_t> expected_suffix = {
-        0x80, 0x01, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x61, 0x18, 0x00, 0x00, 0x00, 0x08,
-        0x0F, 0xDF, 0x9C, 0x1F, 0x9C, 0x1F, 0x9C, 0x00, 0x10, 0x00, 0x00, 0x00, 0x28, 0x46,
-        0x00, 0x00, 0x00, 0x04, 0x05, 0xF7, 0xDD, 0x07, 0xE7, 0x07, 0xE7, 0x00, 0x04};
-    const std::vector<std::uint8_t> actual_suffix(f.body.begin() + 8, f.body.end());
-
-    EXPECT_EQ(actual_suffix, expected_suffix);
+    ASSERT_EQ(decoded.size(), 1u);
+    constexpr std::uint32_t kRotBit = 1U << 3U;
+    constexpr std::uint32_t kExpectedMask = 0x02Bu;  // DEF | POS | ROT | HEALTH
+    EXPECT_NE(decoded.at(0).mask & kRotBit, 0u);
+    EXPECT_EQ(decoded.at(0).mask, kExpectedMask);
+    EXPECT_EQ(decoded.at(0).net_id, 9);
 }
 
 TEST(BringupPackets, BehaviorMatchesPythonPacketsTomlDefaults) {
     const auto bytes = BuildBehavior();
     EXPECT_EQ(bytes.size(), 3566u);
     EXPECT_EQ(Fnv1a32(bytes), 0x11c91899u);
+}
+
+// DISABLED dev aid (NOT run in CI): dumps the BEHAVIOR/TRANSLATION *bodies* (the bytes
+// the engine dispatcher wraps in a MemBuff and passes to Net_HandleBehavior /
+// Net_HandleTranslationTable — i.e. frame minus the 2-byte length + 1 opcode) to
+// behavior_body.bin / translation_body.bin in the CWD, so the live dev-console probe
+// (tools/feed_onjoin_probe.py) can feed them through the engine's own on-join handlers.
+// Run explicitly:
+//   build/wfh_tests.exe --gtest_filter=*DumpOnJoinBodies* --gtest_also_run_disabled_tests
+TEST(BringupPackets, DISABLED_DumpOnJoinBodies) {
+    const auto write_body = [](const char* path, const std::vector<std::uint8_t>& bytes) {
+        const Frame frame = FirstFrame(bytes);
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(frame.body.data()),
+                  static_cast<std::streamsize>(frame.body.size()));
+        std::cout << path << " opcode=0x" << std::hex << static_cast<int>(frame.opcode) << std::dec
+                  << " body_len=" << frame.body.size() << "\n";
+    };
+    write_body("behavior_body.bin", BuildBehavior());
+    write_body("translation_body.bin", BuildTranslation());
+    SUCCEED();
 }
 
 TEST(WorldPackets, SpawnResultPacketsMatchPythonReferenceShapes) {
@@ -713,6 +741,73 @@ TEST(Connection, InGameUdpReincarnateSpawnRequestEnqueuesCommand) {
     EXPECT_EQ(cmds.at(0).pad_id, 99);
 }
 
+TEST(BringupPackets, UdpUpdateStatsMatchesPythonTeamSwitchBytes) {
+    // Byte-for-byte match of the reference server's UPDATE_STATS (0x1C) emitted on a
+    // team switch (captured: player_id=4 team=2). This is the packet that makes the
+    // client update its roster list + activate the entry-map / respawn selector.
+    const auto bytes = BuildUdpUpdateStats(4, 2);
+    const std::vector<std::uint8_t> expected = {
+        0x1C,                    // opcode
+        0x00, 0x00, 0x00, 0x04,  // player_id = 4
+        0x00, 0x00, 0x00, 0x06,  // record kind = 6
+        0x00, 0x02,              // team = 2
+        0x00, 0x21,              // field mask = 33
+        0x00, 0x03,              // field a = 3
+        0x00, 0x05,              // field b = 5
+        0x00, 0x09,              // field c = 9
+        0x00, 0x01, 0x00, 0x00,  // fixed16.16 1.0
+        0x00, 0x01, 0x00, 0x00,  // fixed16.16 1.0
+        0x00, 0x00, 0x00, 0x0A,  // trailing flags = 10
+    };
+    EXPECT_EQ(bytes, expected);
+}
+
+TEST(Connection, InGameUdpTeamSwitchEmitsAckAndUpdateStats) {
+    ServerConfig cfg;
+    IncomingCmdQueue inbound;
+    Connection conn(1, cfg, "Key1234", inbound);
+    (void)conn.OnAccept();
+
+    wfh::proto::BitWriter echo;
+    echo.WriteByte(0x01);
+    echo.WriteString("Key1234");
+    const auto echo_body = echo.Bytes();
+    (void)conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Hello), echo_body.data(),
+                           echo_body.size());
+
+    const auto login = MakePythonStyleLoginFrame("codex_a", "pass_local");
+    (void)conn.OnTcpData(login.data(), login.size());
+    ASSERT_EQ(conn.State(), ConnState::Verified);
+    const auto want_updates = MakeFrame(Opcode::WantUpdates, [](wfh::proto::BitWriter&) {});
+    (void)conn.OnTcpData(want_updates.data(), want_updates.size());
+    ASSERT_EQ(conn.State(), ConnState::InGame);
+    (void)inbound.DrainAll();
+
+    const auto team_body = MakeTeamRequestBody(0x0007, 2);
+    const auto step = conn.OnUdpPacket(static_cast<std::uint8_t>(Opcode::Reincarnate),
+                                       team_body.data(), team_body.size());
+
+    EXPECT_FALSE(step.close);
+    // The ack still goes out as the single udp_out datagram.
+    ExpectUdpAck(step.udp_out.data(), step.udp_out.size(), 0x0007,
+                 static_cast<std::uint8_t>(Opcode::Reincarnate));
+    // The team-switch reply adds the UPDATE_STATS (0x1C) record on UDP.
+    ASSERT_EQ(step.udp_datagrams.size(), 1u);
+    const auto& stats = step.udp_datagrams.at(0);
+    wfh::proto::BitReader r(stats.data(), stats.size());
+    EXPECT_EQ(r.ReadByte().value(), 0x1Cu);  // UPDATE_STATS opcode
+    EXPECT_EQ(r.ReadI32().value(), 1);       // player_id (session 1)
+    EXPECT_EQ(r.ReadI32().value(), 6);       // record kind
+    EXPECT_EQ(r.ReadU16().value(), 2u);      // team = 2
+    EXPECT_FALSE(r.Failed());
+
+    // The team switch is still queued for the world bridge.
+    const auto cmds = inbound.DrainAll();
+    ASSERT_EQ(cmds.size(), 1u);
+    EXPECT_EQ(cmds.at(0).kind, ClientCommandKind::Reincarnate);
+    EXPECT_EQ(cmds.at(0).team, 2);
+}
+
 TEST(Connection, EarlyGenericPacketBeforeKeyEchoIsNoOp) {
     ServerConfig cfg;
     IncomingCmdQueue inbound;
@@ -832,6 +927,9 @@ TEST(MvpOnlineBridge, ReincarnateSpawnUsesRepairPadAndBroadcastsSpawnState) {
     inbound.Push(connected);
     inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
 
+    // Pick a team first (team-switch reincarnate); spawn is rejected without one.
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 1, 0, 0, {}});
+
     ClientCommand spawn;
     spawn.kind = ClientCommandKind::Reincarnate;
     spawn.session_id = 1;
@@ -887,6 +985,9 @@ TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
     inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 2, 0, 0.0F, 0, 0, 0, "bob"});
     inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
     inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 2});
+    // Each picks a team (team-switch) before spawning.
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 1, 0, 0, {}});
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 2, 0, 0.0F, 2, 0, 0, {}});
     inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 0, 1, 0, {}});
     inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 2, 0, 0.0F, 0, 2, 0, {}});
 
@@ -911,16 +1012,61 @@ TEST(MvpOnlineBridge, TwoSpawnedSessionsReceiveSnapshotsWithBothTanksAndPads) {
     std::filesystem::remove_all(root);
 }
 
-// M6.1: when a world provider is set (the engine read), the snapshot sent to clients
-// is the real engine world, replacing the MVP placeholder static pads / session tanks.
-TEST(MvpOnlineBridge, WorldProviderOverridesSnapshotWithEngineEntities) {
+// A team switch must reach OTHER clients (UPDATE_STATS 0x1C broadcast) so their roster
+// lists reflect the change; the requester gets that record on UDP from its Connection and
+// only the REINCARNATE(code 17) confirm here, so it must NOT also get the broadcast.
+TEST(MvpOnlineBridge, TeamSwitchBroadcastsUpdateStatsToOtherClients) {
     WorldBootstrapConfig bootstrap;
-    bootstrap.map_name = "no_such_map_for_provider_test";  // no state file -> fallback pads exist
+    bootstrap.map_name = "no_such_map_for_broadcast_test";  // fallback pads; no spawn here
     IncomingCmdQueue inbound;
     OutboundStateQueue outbound;
     MvpOnlineBridge bridge(inbound, outbound, bootstrap);
 
-    // One authoritative engine tank; this must be what the client sees (not the pads).
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 1, 0, 0.0F, 0, 0, 0, "alice"});
+    inbound.Push(ClientCommand{ClientCommandKind::ClientConnected, 2, 0, 0.0F, 0, 0, 0, "bob"});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 1});
+    inbound.Push(ClientCommand{ClientCommandKind::WantUpdates, 2});
+    bridge.Tick(1);
+    (void)outbound.DrainAll();  // discard join/roster/snapshot bring-up
+
+    // Session 1 switches to team 2.
+    inbound.Push(ClientCommand{ClientCommandKind::Reincarnate, 1, 0, 0.0F, 2, 0, 0, {}});
+    bridge.Tick(2);
+    const auto messages = outbound.DrainAll();
+
+    bool peer_got_update_stats = false;
+    bool requester_got_update_stats = false;
+    for (const OutboundMessage& msg : messages) {
+        const Frame frame = FirstFrame(msg.bytes);
+        if (frame.opcode != static_cast<std::uint8_t>(Opcode::UpdateStats)) {
+            continue;
+        }
+        if (msg.session_id == 2u) {
+            BitReader r(frame.body.data(), frame.body.size());
+            EXPECT_EQ(r.ReadI32().value(), 1);   // switcher's player_id
+            EXPECT_EQ(r.ReadI32().value(), 6);   // record kind
+            EXPECT_EQ(r.ReadU16().value(), 2u);  // new team
+            peer_got_update_stats = true;
+        }
+        if (msg.session_id == 1u) {
+            requester_got_update_stats = true;
+        }
+    }
+    EXPECT_TRUE(peer_got_update_stats);
+    EXPECT_FALSE(requester_got_update_stats);
+}
+
+// M6.1: when a world provider is set (the engine read), its dynamic entities are sent
+// ALONGSIDE the map fixtures (pads/bases from the parsed state), not instead of them —
+// so the client both sees the engine world AND can open the entry map / pick a pad.
+TEST(MvpOnlineBridge, WorldProviderAddsEngineEntitiesToMapFixtures) {
+    WorldBootstrapConfig bootstrap;
+    bootstrap.map_name = "no_such_map_for_provider_test";  // no state file -> 2 fallback pads
+    IncomingCmdQueue inbound;
+    OutboundStateQueue outbound;
+    MvpOnlineBridge bridge(inbound, outbound, bootstrap);
+
+    // One authoritative engine tank, in addition to the map's repair pads.
     bridge.SetWorldProvider([] {
         MvpEntitySnapshot tank;
         tank.net_id = 99;
@@ -938,10 +1084,71 @@ TEST(MvpOnlineBridge, WorldProviderOverridesSnapshotWithEngineEntities) {
     const auto snapshot = FirstViewUpdateForSession(outbound.DrainAll(), 1);
     ASSERT_TRUE(snapshot.has_value());
     const auto entities = DecodeEntitiesInViewUpdate(*snapshot);
-    ASSERT_EQ(entities.size(), 1U);  // only the engine entity, not the fallback pads
-    EXPECT_EQ(entities.at(0).net_id, 99);
-    EXPECT_EQ(entities.at(0).unit_type, 1U);
-    EXPECT_EQ(entities.at(0).team, 2U);
+    // 2 fallback repair pads (the map fixtures / spawn points) + the 1 engine tank.
+    EXPECT_EQ(entities.size(), 3U);
+    const bool has_engine_tank =
+        std::any_of(entities.begin(), entities.end(),
+                    [](const DecodedEntity& e) { return e.net_id == 99 && e.unit_type == 1U; });
+    EXPECT_TRUE(has_engine_tank);
+    constexpr std::uint32_t kRepairPadType = 27;
+    const int pads = CountEntitiesMatching(entities, kRepairPadType, 1U, false) +
+                     CountEntitiesMatching(entities, kRepairPadType, 2U, false);
+    EXPECT_EQ(pads, 2);
+}
+
+// --- UDP reliable-stream handshake (server->client) ------------------------
+
+TEST(UdpHandshake, AckIsOpcodeSubcmdAndTicksBigEndian) {
+    const auto bytes = BuildUdpHandshakeAck(7);
+    ASSERT_EQ(bytes.size(), 6U);  // [0x02][subcmd 0][i32 ticks]
+    EXPECT_EQ(bytes.at(0), 0x02U);
+    EXPECT_EQ(bytes.at(1), 0x00U);
+    EXPECT_EQ(bytes.at(2), 0U);
+    EXPECT_EQ(bytes.at(3), 0U);
+    EXPECT_EQ(bytes.at(4), 0U);
+    EXPECT_EQ(bytes.at(5), 7U);  // big-endian low byte
+}
+
+TEST(UdpHandshake, StreamUnpauseCarriesStreamIdAndSeq) {
+    const auto bytes = BuildUdpStreamUnpause(3);
+    ASSERT_EQ(bytes.size(), 4U);  // [0x04][byte stream_id][u16 seq]
+    EXPECT_EQ(bytes.at(0), 0x04U);
+    EXPECT_EQ(bytes.at(1), 3U);
+    EXPECT_EQ(bytes.at(2), 0U);
+    EXPECT_EQ(bytes.at(3), 1U);  // seq = 1, big-endian
+}
+
+TEST(UdpHandshake, PongEchoesTimestamp) {
+    const auto bytes = BuildUdpPong(0x12345678);
+    ASSERT_EQ(bytes.size(), 5U);  // [0x0C][i32]
+    EXPECT_EQ(bytes.at(0), 0x0CU);
+    EXPECT_EQ(bytes.at(1), 0x12U);
+    EXPECT_EQ(bytes.at(2), 0x34U);
+    EXPECT_EQ(bytes.at(3), 0x56U);
+    EXPECT_EQ(bytes.at(4), 0x78U);
+}
+
+TEST(UdpHandshake, StreamDefsDefineFourGameplayStreams) {
+    const auto bytes = BuildUdpStreamDefs(0, 42);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(bytes.at(0), 0x03U);  // D_HANDSHAKE opcode
+    wfh::proto::BitReader r(bytes.data() + 1, bytes.size() - 1);
+    EXPECT_EQ(r.ReadI32().value_or(-1), 0);   // ticks
+    EXPECT_EQ(r.ReadI32().value_or(-1), 42);  // player_id
+    EXPECT_EQ(r.ReadI32().value_or(-1), 4);   // def count
+    const std::array<std::string_view, 4> names = {"Unreliable", "Reliable", "Stream 2",
+                                                   "Game Data"};
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(r.ReadString(64).value_or(""), names.at(static_cast<std::size_t>(i)));
+        EXPECT_EQ(r.ReadI32().value_or(-1), 1);  // id count
+        EXPECT_EQ(r.ReadI32().value_or(-1), i);  // stream id
+    }
+    EXPECT_EQ(r.ReadI32().value_or(-1), 4);  // config count
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(r.ReadI32().value_or(-1), i);  // stream id
+        EXPECT_EQ(r.ReadI32().value_or(-1), 1);  // priority
+    }
+    EXPECT_FALSE(r.Failed());
 }
 
 TEST(Connection, VersionMismatchDrops) {
@@ -1288,6 +1495,100 @@ TEST(Acceptor, LinkedRawUdpReincarnateEnqueuesCommand) {
     closesocket(tcp);
     acceptor.Stop();
     WSACleanup();
+}
+
+// --- Dev console (live engine poke socket) ---------------------------------
+
+auto AddrOf(const void* ptr) -> std::uint32_t {
+    // The DLL + tests are 32-bit, so a pointer fits in a u32 dev-console address.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(ptr));
+}
+
+TEST(DevConsole, ParsesPeek) {
+    const auto cmd = ParseDevCommand("peek 0x4f9e20 32");
+    EXPECT_EQ(cmd.kind, DevCmdKind::Peek);
+    EXPECT_EQ(cmd.addr, 0x004f9e20U);
+    EXPECT_EQ(cmd.len, 32U);
+    EXPECT_TRUE(cmd.error.empty());
+}
+
+TEST(DevConsole, ParsesPokeBytes) {
+    const auto cmd = ParseDevCommand("poke 600000 deadBEef");
+    EXPECT_EQ(cmd.kind, DevCmdKind::Poke);
+    EXPECT_EQ(cmd.addr, 0x00600000U);
+    EXPECT_EQ(cmd.bytes, (std::vector<std::uint8_t>{0xDE, 0xAD, 0xBE, 0xEF}));
+}
+
+TEST(DevConsole, ParsesHelpAndRejectsGarbage) {
+    EXPECT_EQ(ParseDevCommand("help").kind, DevCmdKind::Help);
+    EXPECT_EQ(ParseDevCommand("?").kind, DevCmdKind::Help);
+    const auto bad = ParseDevCommand("frobnicate 1 2");
+    EXPECT_EQ(bad.kind, DevCmdKind::Unknown);
+    EXPECT_FALSE(bad.error.empty());
+    // Malformed peek (missing len) is an error, not a silent accept.
+    EXPECT_FALSE(ParseDevCommand("peek 0x1000").error.empty());
+}
+
+TEST(DevConsole, ParsesCall) {
+    const auto cmd = ParseDevCommand("call 0x4f9e20 thiscall 0383dd58 09271c48");
+    EXPECT_EQ(cmd.kind, DevCmdKind::Call);
+    EXPECT_EQ(cmd.addr, 0x004f9e20U);
+    EXPECT_EQ(cmd.conv, "thiscall");
+    EXPECT_EQ(cmd.args, (std::vector<std::uint32_t>{0x0383dd58U, 0x09271c48U}));
+    EXPECT_TRUE(cmd.error.empty());
+    EXPECT_FALSE(ParseDevCommand("call 0x1000 bogusconv").error.empty());  // bad convention
+    EXPECT_FALSE(ParseDevCommand("call 0x1000").error.empty());            // missing convention
+    EXPECT_EQ(ParseDevCommand("bt").kind, DevCmdKind::Backtrace);
+}
+
+TEST(DevConsole, HexHelpers) {
+    std::uint32_t value = 0;
+    EXPECT_TRUE(ParseHexU32("0x4F9e20", value));
+    EXPECT_EQ(value, 0x004f9e20U);
+    EXPECT_TRUE(ParseHexU32("abc", value));
+    EXPECT_EQ(value, 0x00000abcU);
+    EXPECT_FALSE(ParseHexU32("xyz", value));
+    EXPECT_FALSE(ParseHexU32("", value));
+    EXPECT_FALSE(ParseHexU32("123456789", value));  // > 8 hex digits overflows u32
+
+    std::vector<std::uint8_t> bytes;
+    EXPECT_TRUE(ParseHexBytes("deadbeef", bytes));
+    EXPECT_EQ(bytes, (std::vector<std::uint8_t>{0xDE, 0xAD, 0xBE, 0xEF}));
+    EXPECT_FALSE(ParseHexBytes("abc", bytes));  // odd length
+    EXPECT_FALSE(ParseHexBytes("gg", bytes));   // non-hex
+}
+
+TEST(DevConsole, SafeReadRoundTripsAndFaultsSafely) {
+    const std::array<std::uint8_t, 4> src{0x11, 0x22, 0x33, 0x44};
+    std::vector<std::uint8_t> out;
+    EXPECT_TRUE(SafeReadMemory(AddrOf(src.data()), src.size(), out));
+    EXPECT_EQ(out, (std::vector<std::uint8_t>{0x11, 0x22, 0x33, 0x44}));
+
+    // A null read must be caught by the SEH guard, not crash the process.
+    out.assign(99, 0xCC);
+    EXPECT_FALSE(SafeReadMemory(0, 8, out));
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(DevConsole, SafeWriteUpdatesAWritableBuffer) {
+    std::array<std::uint8_t, 4> dst{0, 0, 0, 0};
+    EXPECT_TRUE(SafeWriteMemory(AddrOf(dst.data()), {0xAA, 0xBB, 0xCC, 0xDD}));
+    EXPECT_EQ(dst, (std::array<std::uint8_t, 4>{0xAA, 0xBB, 0xCC, 0xDD}));
+}
+
+TEST(DevConsole, ExecutePeekDumpsBytesAndHelpLists) {
+    const std::array<std::uint8_t, 4> src{0x11, 0x22, 0x33, 0x44};
+    DevCommand peek;
+    peek.kind = DevCmdKind::Peek;
+    peek.addr = AddrOf(src.data());
+    peek.len = 4;
+    const std::string dump = ExecuteDevCommand(peek);
+    EXPECT_NE(dump.find("11 22 33 44"), std::string::npos);
+
+    DevCommand help;
+    help.kind = DevCmdKind::Help;
+    EXPECT_NE(ExecuteDevCommand(help).find("peek"), std::string::npos);
 }
 
 }  // namespace

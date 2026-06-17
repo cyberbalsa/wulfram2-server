@@ -14,6 +14,9 @@ namespace wfh::server {
 // Defaults (Wulf-Forge used 2627 for TCP+UDP; 20 Hz matches the engine tick).
 constexpr std::uint16_t kDefaultPort = 2627;
 constexpr std::uint32_t kDefaultTickHz = 20;
+// Dev command-socket default port (the engine's legacy DbgNet debug port). On by default
+// for development; set dev_port = 0 in headless.toml to disable.
+constexpr std::uint16_t kDefaultDevPort = 6969;
 
 struct ServerConfig {
     std::uint16_t bind_port = kDefaultPort;         // TCP + UDP listen port
@@ -24,6 +27,9 @@ struct ServerConfig {
     // session -> load map -> game mode -> spawn) so the engine owns + ticks the
     // world. Default off so the verified MVP/self-connection path is unchanged.
     bool world_host = false;
+    // Dev localhost command socket for live engine poking (peek/poke/call/bp/...). On by
+    // default at 6969 (the engine's legacy DbgNet port); set dev_port = 0 to disable.
+    std::uint16_t dev_port = kDefaultDevPort;
 };
 
 // Parse the [server] keys (bind_port, tick_hz, map) from headless.toml contents.

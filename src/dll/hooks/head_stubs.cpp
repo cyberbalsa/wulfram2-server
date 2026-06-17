@@ -2,6 +2,7 @@
 
 #include "engine_hooks.hpp"
 
+#include "server/dev_engine.hpp"
 #include "server/world_host_engine.hpp"
 
 #include "wfh/log.hpp"
@@ -453,6 +454,10 @@ void __cdecl ServerTickBody(void* /*user*/) {
     // (reset -> load map -> game mode -> spawn) so the engine owns + ticks the world.
     // Runs on the engine main thread inside this SEH-guarded tick. No-op otherwise.
     server::ProcessWorldHostTick();
+
+    // Dev console: execute any pending `call` on this (engine) thread + capture the thread
+    // id for `bt`. Cheap no-op when nothing is pending.
+    server::PumpDevEngine();
 }
 
 // Detour for Net_ServiceConnection (void __stdcall). Calls the engine's real net pump

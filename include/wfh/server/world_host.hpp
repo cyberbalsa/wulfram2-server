@@ -55,14 +55,17 @@ enum class WorldHostPhase : int {
 constexpr float kDefaultSpawnX = 2437.0F;
 constexpr float kDefaultSpawnY = 3269.0F;
 constexpr float kDefaultSpawnZ = -180.0F;
+// High OID so the engine entity does not collide with map-fixture net-ids (1..N), which
+// are sent alongside it in the same snapshot.
+constexpr std::int32_t kDefaultSpawnOid = 9001;
 
 // The one authoritative entity to spawn (M5.4-min proves the spawn/world path with
 // a single object; M6 scales to the full world). Plain value type.
 struct WorldHostEntitySpec {
-    std::int32_t oid = 1;        // OID handed to Obj_Create (engine registers it)
-    std::int32_t unit_type = 1;  // engine unit type id (1 = tank)
-    std::int32_t owner = 0;      // owning player id (0 = server-owned)
-    std::int32_t team = 1;       // team id
+    std::int32_t oid = kDefaultSpawnOid;  // OID handed to Obj_Create (engine registers it)
+    std::int32_t unit_type = 1;           // engine unit type id (1 = tank)
+    std::int32_t owner = 0;               // owning player id (0 = server-owned)
+    std::int32_t team = 1;                // team id
     std::array<float, 3> pos{kDefaultSpawnX, kDefaultSpawnY, kDefaultSpawnZ};  // spawn position
     std::array<float, 3> rot{0.0F, 0.0F, 0.0F};                                // euler orientation
 };

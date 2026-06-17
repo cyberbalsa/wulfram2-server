@@ -3,14 +3,18 @@
 #include "server/engine_thunks.hpp"
 
 #include "wfh/log.hpp"
+#include "wfh/proto/framing.hpp"
 #include "wfh/server/entity_snapshot.hpp"
 #include "wfh/server/runtime.hpp"
 #include "wfh/server/server_config.hpp"
 #include "wfh/server/world_host.hpp"
 #include "wfh/server/world_packets.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -65,6 +69,50 @@ constexpr std::size_t kNodeEntityOff = 8;
 constexpr int kMaxWorldEntities = 4096;  // sanity cap if memory is unexpected
 constexpr int kReadbackEvery = 200;      // throttle the readback log (~once/sec)
 
+// --- M6 vehicle-drive spike (Increment 1): construct an engine vehicle controller for the
+// test-spawn entity and confirm the engine resolved a model (proves the headless server
+// has the vehicle-model registry populated). No physics step yet — that's Increment 2.
+constexpr std::uint32_t kInitForEntityParam2VA = 0x0067cd58;  // DAT_0067cd58 (engine global)
+constexpr std::size_t kControllerSize = 0x20;                 // Tank_Construct object size
+constexpr std::uintptr_t kVehicleVtableOff = 0x00;            // controller+0x00 = vtable (0x543128)
+constexpr std::uintptr_t kVehicleModelOff = 0x10;             // controller+0x10 = resolved model
+
+// --- M6 on-join self-load: feed the server's own BEHAVIOR through the engine's CLIENT-side
+// handler so the headless engine's vehicle physics tuning is populated, exactly as a joined
+// client's would be. The engine booted a world but never "joined a server", so the on-join
+// state a server pushes (BEHAVIOR = physics globals + per-model vehicle tuning) was unset.
+// We mirror the engine's OWN receive path (Net_ProcessOrderedReceiveQueue @ 0x504a2c):
+//   membuf = _malloc(0x20); body = _malloc(len); copy body bytes;
+//   BitBuf_ConstructWithChunk(membuf, mode=1, body, len, owner=0);   // __thiscall ECX=membuf
+//   Net_HandleBehavior(0, 0, membuf);                                // __cdecl, packet=membuf
+//   MemBuff_FreeAllHunks(membuf); _free(membuf);                     // recv-path cleanup
+// All calls go through SafeEngineInvoke (the same convention-agnostic, SEH-guarded invoker
+// the dev console uses). VALIDATED LIVE before wiring (tools/feed_onjoin_probe.py): the
+// 0x679170 scalar block goes zero->non-zero and the Tank model config doubles load (hover
+// 3.25->9.75), no crash. Net_HandleBehavior's only side effect is Net_FlushSendBuffer on the
+// packet itself, so no live connection is needed (unlike TRANSLATION, whose 0x33 ACK needs a
+// send object -- and TRANSLATION is not required: our C++ relay does its own quantization).
+constexpr std::uint32_t kMallocVA = 0x0050c8eb;                    // void* __cdecl _malloc(size_t)
+constexpr std::uint32_t kFreeVA = 0x0050c292;                      // void  __cdecl _free(void*)
+constexpr std::uint32_t kBitBufConstructWithChunkVA = 0x00508a50;  // __thiscall, RET 0x10
+constexpr std::uint32_t kMemBuffFreeAllHunksVA = 0x00509a30;       // __thiscall(this)
+constexpr std::uint32_t kNetHandleBehaviorVA = 0x0046dc00;         // __cdecl(p1, p2, packet)
+constexpr std::uint32_t kMemBuffStructSize = 0x20;                 // BitBuf object size (recv path)
+constexpr std::uint32_t kMemBuffReadMode = 1;                      // mode arg for a read buffer
+
+// Mutable spike state lives in a function-local static (engine-thread-only), mirroring the
+// file's other statics — kept off file scope. `controller` is the server-owned 0x20-byte
+// vehicle-controller buffer (an array of void* so it is pointer-aligned for the vtable).
+struct VehicleDriveState {
+    std::array<void*, kControllerSize / sizeof(void*)> controller{};
+    void* entity = nullptr;  // test tank entity captured from DoSpawn
+    bool built = false;      // controller constructed yet?
+};
+auto DriveState() -> VehicleDriveState& {
+    static VehicleDriveState state;
+    return state;
+}
+
 void EngineGameResetSession() {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast,performance-no-int-to-ptr)
     reinterpret_cast<void(__cdecl*)(char)>(static_cast<std::uintptr_t>(kGameResetSessionVA))(0);
@@ -112,6 +160,7 @@ void DoSpawn(const WorldHostEntitySpec& entity) {
              static_cast<double>(entity.pos.at(2)));
     EngineObjInitFromSpawn(obj, entity.pos.at(0), entity.pos.at(1), entity.pos.at(2),
                            entity.rot.at(0), entity.rot.at(1), entity.rot.at(2));
+    DriveState().entity = obj;  // M6: remember the entity so we can attach a vehicle controller
     WFH_INFO("worldhost", "spawned entity oid=%d into world list + spatial index", entity.oid);
 }
 
@@ -177,6 +226,105 @@ void LogWorldReadback() {
     }
 }
 
+// Increment 1: build a vehicle controller for the test entity ONCE and log whether the
+// engine resolved a model. vtable should be 0x543128 (Tank_Vehicle) and model should be
+// non-zero (its own vtable 0x5430e8) — a zero model means the headless boot did NOT
+// populate the vehicle-model registry, which would block this whole approach. Runs on the
+// SEH-guarded tick thread, so a bad call faults safely instead of crashing the engine.
+void BuildDriveController() {
+    VehicleDriveState& st = DriveState();
+    if (st.built || st.entity == nullptr) {
+        return;
+    }
+    st.built = true;  // one-shot regardless of outcome (avoid retrying a faulting call)
+    void* controller = static_cast<void*>(st.controller.data());
+    EngineTankConstruct(controller);
+
+    const std::uint32_t param2 = DerefU32(kInitForEntityParam2VA);
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
+    void* param2_ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(param2));
+    EngineVehicleInitForEntity(controller, st.entity, param2_ptr);
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto ctrl_addr = reinterpret_cast<std::uintptr_t>(controller);
+    const std::uint32_t vtable = DerefU32(ctrl_addr + kVehicleVtableOff);
+    const std::uint32_t model = DerefU32(ctrl_addr + kVehicleModelOff);
+    WFH_INFO("worldhost",
+             "M6 drive controller built: controller=0x%08X vtable=0x%08X (expect 0x543128) "
+             "model=0x%08X param2=0x%08X (model!=0 => vehicle-model registry present)",
+             static_cast<unsigned>(ctrl_addr), vtable, model, param2);
+    if (model != 0) {
+        WFH_INFO("worldhost", "M6 model vtable=0x%08X (expect 0x5430e8)", DerefU32(model));
+    }
+}
+
+// Engine-malloc `size` bytes via the engine CRT heap. Returns 0 on fault/OOM. The buffers
+// we hand to the MemBuff are freed by the engine (RetrieveBits / FreeAllHunks), so they
+// MUST come from this heap, not operator new / a static region.
+auto EngineMalloc(std::uint32_t size) -> std::uint32_t {
+    std::uint32_t arg = size;
+    const InvokeResult res = SafeEngineInvoke(kMallocVA, 0, 0, &arg, 1);
+    return res.faulted ? 0 : res.eax;
+}
+
+void EngineFree(std::uint32_t ptr) {
+    if (ptr != 0) {
+        SafeEngineInvoke(kFreeVA, 0, 0, &ptr, 1);
+    }
+}
+
+// Feed the server's own BEHAVIOR body through Net_HandleBehavior so the headless engine's
+// vehicle physics tuning is loaded (the on-join self-load). One-shot; runs on the SEH-guarded
+// tick thread after the world-host bootstrap completes. See the VA block above for the recipe
+// + the live validation. Necessary (loads move/turn/strafe adjust etc. the thrust math reads),
+// though not yet sufficient to DRIVE a non-local entity (the per-vehicle slot table is still
+// unpopulated — the next increment).
+void FeedBehaviorToEngine() {
+    const std::vector<std::uint8_t> framed = BuildBehavior();  // [u16 len][0x24][body]
+    proto::TcpFrameAccumulator acc;
+    acc.Feed(framed.data(), framed.size());
+    const std::optional<proto::Frame> frame = acc.Next();
+    if (!frame || frame->body.empty()) {
+        WFH_WARN("worldhost", "on-join BEHAVIOR feed skipped: could not extract frame body");
+        return;
+    }
+    const auto body_len = static_cast<std::uint32_t>(frame->body.size());
+
+    const std::uint32_t data = EngineMalloc(body_len);
+    if (data == 0) {
+        WFH_WARN("worldhost", "on-join BEHAVIOR feed: engine _malloc(%u) failed", body_len);
+        return;
+    }
+    // Same process: copy the body straight into the engine heap buffer.
+    // NOLINTNEXTLINE(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(data)), frame->body.data(),
+                body_len);
+
+    const std::uint32_t membuf = EngineMalloc(kMemBuffStructSize);
+    if (membuf == 0) {
+        WFH_WARN("worldhost", "on-join BEHAVIOR feed: engine _malloc(membuf) failed");
+        EngineFree(data);  // engine heap; safe to free the orphaned body
+        return;
+    }
+
+    // BitBuf_ConstructWithChunk(membuf, mode=1, body, len, owner=0) — __thiscall ECX=membuf.
+    const std::array<std::uint32_t, 4> cc = {kMemBuffReadMode, data, body_len, 0};
+    SafeEngineInvoke(kBitBufConstructWithChunkVA, membuf, 0, cc.data(),
+                     static_cast<int>(cc.size()));
+    // Net_HandleBehavior(0, 0, membuf) — __cdecl; p1/p2 are unused by the handler.
+    const std::array<std::uint32_t, 3> hb = {0, 0, membuf};
+    const InvokeResult res =
+        SafeEngineInvoke(kNetHandleBehaviorVA, 0, 0, hb.data(), static_cast<int>(hb.size()));
+    // Cleanup mirrors Net_ProcessOrderedReceiveQueue (frees the chunk's backing + the struct).
+    SafeEngineInvoke(kMemBuffFreeAllHunksVA, membuf, 0, nullptr, 0);
+    EngineFree(membuf);
+
+    WFH_INFO("worldhost",
+             "on-join BEHAVIOR fed to engine (body=%u bytes, faulted=%d): vehicle physics tuning "
+             "loaded (move/turn/strafe adjust, gravity, rates)",
+             body_len, static_cast<int>(res.faulted));
+}
+
 }  // namespace
 
 void ProcessWorldHostTick() {
@@ -204,6 +352,10 @@ void ProcessWorldHostTick() {
     static bool logged_done = false;
     if (bootstrap.done() && !logged_done) {
         WFH_INFO("worldhost", "world-host bootstrap complete");
+        // On-join self-load: feed our own BEHAVIOR through the engine's client-side handler
+        // so the engine's vehicle physics tuning is populated (it booted a world but never
+        // "joined", so this state was unset). Runs once, on this tick thread.
+        FeedBehaviorToEngine();
         // Arm the authoritative relay: the MVP bridge now sources its VIEW_UPDATE
         // entities from the live engine world instead of placeholder data, so
         // connected clients see the engine's real objects. The provider runs on this
@@ -217,6 +369,7 @@ void ProcessWorldHostTick() {
     // Once the world is populated, periodically read it back by value (the engine is
     // now the source of truth). M6.1 will feed this snapshot to connected clients.
     if (bootstrap.done()) {
+        BuildDriveController();  // M6 Increment 1: attach a vehicle controller to the test entity
         LogWorldReadback();
     }
 }

@@ -1,9 +1,11 @@
 #include "wfh/init.hpp"
 
+#include "server/dev_engine.hpp"
 #include "wfh/config.hpp"
 #include "wfh/log.hpp"
 #include "wfh/pe_validate.hpp"
 #include "wfh/ready_event.hpp"
+#include "wfh/server/dev_console.hpp"
 #include "wfh/server/runtime.hpp"
 #include "wfh/server/server_config.hpp"
 
@@ -161,6 +163,11 @@ void StartServerOrAbort(const std::string& config_text) {
     }
     WFH_INFO("init", "server runtime listening on port %u",
              static_cast<unsigned>(server::ProcessRuntime().BoundPort()));
+    if (server::StartDevConsole(server_cfg.dev_port)) {
+        server::InstallDevEngine();  // wire up call/bt (engine-touching dev commands)
+        WFH_INFO("init", "dev console live on 127.0.0.1:%u (peek/poke/call/bt)",
+                 static_cast<unsigned>(server_cfg.dev_port));
+    }
 }
 // NOLINTEND(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-avoid-do-while)
 
