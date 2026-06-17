@@ -384,6 +384,29 @@ CTest**, `lint.ps1` = **PASS**.
   (`0x0A`/`0x09`) drives each tank from its player. Known refinement unchanged: altitude-hold while
   driving (tanks drift slowly in z; full off-map travel still descends).
 
+### ⏳ M6.4 — ACTION input routing: decode + producer shipped (`6b3e6ba`, `635e4aa`, 2026-06-17)
+The real blocker for "see each other *move*": today a PLAYER tank never moves server-side when the
+player drives (only the 3 demo tanks do), so via `0x0E` peers see each other frozen. Decoding the
+client's control inputs and driving the player's engine tank fixes that. Two increments landed this
+session, each gated (build `/W4 /WX`, lint PASS, full CTest):
+- **Increment 1 — decoder (`6b3e6ba`).** `server/action_input.{hpp,cpp}`: `DecodeActionUpdate` (`0x0A`)
+  + `DecodeActionDump` (`0x09`). Wire format **verified from the binary (Ghidra) AND cross-checked
+  against all 826 golden captures**: `0x0A` = `[count:8][timestamp:i32][seq:i32]` then
+  count×(`[channel:16][value]`); `0x09` = `[timestamp][seq]` + channels 1..21 positional. Value = 1
+  bit (digital: ch 4 or ≥8) or 16-bit analog over [high=1.0, low=-1.0] (axes 0,1,2,3,5,6,7) — the exact
+  ramp our `BuildTranslation` sends, which the client encoded against; decode mirrors the engine's
+  `Range_LevelToValue`. Fail-closed via `BitReader`. 9 TDD tests (real captures + round-trip + reject).
+- **Increment 2 — producer (`635e4aa`).** `Connection::OnUdpPacket` decodes in-game `0x09`/`0x0A` and
+  enqueues one validated `ActionInput` command per drivable channel (channel ∈ 0..21, value clamped
+  [-1,1]); never trusts the client-asserted entity id; pre-game ignored, malformed dropped. 2 TDD tests.
+- **Increment 3 (NEXT — needs a live two-client drive test).** Store per-session channels; build a
+  vehicle controller per player tank on spawn (mirror `SetupServerTanks`); drive each player tank from
+  its stored input in `DriveServerTanks` (channel index == tuning slot, the engine's native mapping:
+  write decoded value → `VehicleTuningTable` slot[channel], then the thrust step already runs). Deferred
+  from the overnight batch because its only observable effect is a moved engine entity — an engine-poke
+  that wants the running engine + human eyes, not a unit test. Plan + RE-verified apply offsets:
+  `docs/superpowers/plans/2026-06-17-m6.4-action-input-routing.md`.
+
 ### ✅ M6.3 — in-game UDP `0x0E`/`0x0F` delta relay shipped (`3dc283c`, 2026-06-17)
 Closed the relay gap identified just below. Spawned sessions now receive, **per tick over UDP**,
 `UPDATE_ARRAY 0x0E` (the OTHER dynamic tanks) + `VIEW_UPDATE 0x0F` (self). `0x0F` leads with an i32
