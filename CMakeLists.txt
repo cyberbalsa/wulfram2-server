@@ -84,6 +84,7 @@ add_library(wfh_server_net STATIC
     src/dll/server/net/server_config.cpp
     src/dll/server/net/bringup_packets.cpp
     src/dll/server/net/world_packets.cpp
+    src/dll/server/net/action_input.cpp
     src/dll/server/net/connection.cpp
     src/dll/server/net/acceptor.cpp
     src/dll/server/net/runtime.cpp

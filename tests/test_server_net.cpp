@@ -6,6 +6,7 @@
 #include "wfh/proto/framing.hpp"
 #include "wfh/proto/opcodes.hpp"
 #include "wfh/server/acceptor.hpp"
+#include "wfh/server/action_input.hpp"
 #include "wfh/server/bringup_packets.hpp"
 #include "wfh/server/connection.hpp"
 #include "wfh/server/dev_console.hpp"
@@ -1600,6 +1601,172 @@ TEST(DevConsole, ExecutePeekDumpsBytesAndHelpLists) {
     DevCommand help;
     help.kind = DevCmdKind::Help;
     EXPECT_NE(ExecuteDevCommand(help).find("peek"), std::string::npos);
+}
+
+// ===========================================================================
+// ACTION input decode (M6.4): the inbound 0x0A/0x09 control-channel decoder.
+// Vectors are REAL bytes from tools/captures/action_packets_2026-06-17.txt (the
+// `body` is everything AFTER the opcode byte). The wire format is bit-exact and
+// was cross-validated against all 826 captures (channel idx 16b; analog 16b over
+// [high=1.0, low=-1.0]; digital 1b for ch 4 and ch>=8).
+// ===========================================================================
+
+TEST(ActionInput, ClassifiesDigitalVsAnalogChannels) {
+    for (const std::int32_t analog : {0, 1, 2, 3, 5, 6, 7}) {
+        EXPECT_FALSE(IsDigitalActionChannel(analog)) << "channel " << analog;
+    }
+    for (const std::int32_t digital : {4, 8, 9, 15, 21}) {
+        EXPECT_TRUE(IsDigitalActionChannel(digital)) << "channel " << digital;
+    }
+}
+
+TEST(ActionInput, DecodesDigitalButtonReleaseFromCapture) {
+    // 0a 01 00020bd7 00000000  | ch8(16b)=0x0008 value(1b)=0  -> button 8 released
+    const std::vector<std::uint8_t> body{0x01, 0x00, 0x02, 0x0b, 0xd7, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x08, 0x00};
+    const DecodedActions out = DecodeActionUpdate(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.timestamp, 134103);
+    ASSERT_EQ(out.changes.size(), 1U);
+    EXPECT_EQ(out.changes.at(0).channel, 8);
+    EXPECT_FLOAT_EQ(out.changes.at(0).value, 0.0F);
+}
+
+TEST(ActionInput, DecodesDigitalButtonPressFromCapture) {
+    // 0a 01 0002151f 00000000  | ch8 value(1b)=1 (high bit of 0x80) -> button 8 pressed
+    const std::vector<std::uint8_t> body{0x01, 0x00, 0x02, 0x15, 0x1f, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x08, 0x80};
+    const DecodedActions out = DecodeActionUpdate(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.timestamp, 136479);
+    ASSERT_EQ(out.changes.size(), 1U);
+    EXPECT_EQ(out.changes.at(0).channel, 8);
+    EXPECT_FLOAT_EQ(out.changes.at(0).value, 1.0F);
+}
+
+TEST(ActionInput, DecodesAnalogTurnNearZeroFromCapture) {
+    // 0a 01 00005083 00000000 | ch6(turn) level 0x8587 -> ~ -0.043
+    const std::vector<std::uint8_t> body{0x01, 0x00, 0x00, 0x50, 0x83, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x06, 0x85, 0x87};
+    const DecodedActions out = DecodeActionUpdate(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    ASSERT_EQ(out.changes.size(), 1U);
+    EXPECT_EQ(out.changes.at(0).channel, 6);
+    EXPECT_NEAR(out.changes.at(0).value, -0.0432F, 0.005F);
+}
+
+TEST(ActionInput, DecodesAnalogStrafeHalfBothSignsFromCaptures) {
+    // ch3(strafe) level 0x4000 -> +0.5
+    const std::vector<std::uint8_t> pos{0x01, 0x00, 0x00, 0x6a, 0x46, 0x00, 0x00,
+                                        0x00, 0x00, 0x00, 0x03, 0x40, 0x00};
+    const DecodedActions a = DecodeActionUpdate(pos.data(), pos.size());
+    ASSERT_TRUE(a.ok);
+    ASSERT_EQ(a.changes.size(), 1U);
+    EXPECT_EQ(a.changes.at(0).channel, 3);
+    EXPECT_NEAR(a.changes.at(0).value, 0.5F, 0.005F);
+
+    // ch3 level 0xbfff -> -0.5
+    const std::vector<std::uint8_t> neg{0x01, 0x00, 0x00, 0x91, 0x62, 0x00, 0x00,
+                                        0x00, 0x00, 0x00, 0x03, 0xbf, 0xff};
+    const DecodedActions b = DecodeActionUpdate(neg.data(), neg.size());
+    ASSERT_TRUE(b.ok);
+    ASSERT_EQ(b.changes.size(), 1U);
+    EXPECT_EQ(b.changes.at(0).channel, 3);
+    EXPECT_NEAR(b.changes.at(0).value, -0.5F, 0.005F);
+}
+
+TEST(ActionInput, DecodesMultiChangeUpdateFromCapture) {
+    // 0a 02 00004ae7 00000000 | ch1 level 0x70a2 (~0.120) | ch6 level 0x801f (~0)
+    const std::vector<std::uint8_t> body{0x02, 0x00, 0x00, 0x4a, 0xe7, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x01, 0x70, 0xa2, 0x00, 0x06, 0x80, 0x1f};
+    const DecodedActions out = DecodeActionUpdate(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.timestamp, 19175);
+    ASSERT_EQ(out.changes.size(), 2U);
+    EXPECT_EQ(out.changes.at(0).channel, 1);
+    EXPECT_NEAR(out.changes.at(0).value, 0.120F, 0.005F);
+    EXPECT_EQ(out.changes.at(1).channel, 6);
+    EXPECT_NEAR(out.changes.at(1).value, 0.0F, 0.01F);
+}
+
+TEST(ActionInput, DecodesActionDumpAllChannelsFromCapture) {
+    // 09 00004832 00000000 | values of channels 1..21 (positional, no index)
+    const std::vector<std::uint8_t> body{0x00, 0x00, 0x48, 0x32, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0xcd,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const DecodedActions out = DecodeActionDump(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.timestamp, 18482);
+    ASSERT_EQ(out.changes.size(), 21U);
+    // Positional: changes[i] is channel i+1, all in 1..21; analog values stay in [-1,1].
+    for (std::size_t i = 0; i < out.changes.size(); ++i) {
+        EXPECT_EQ(out.changes.at(i).channel, static_cast<std::int32_t>(i) + 1);
+        if (!IsDigitalActionChannel(out.changes.at(i).channel)) {
+            EXPECT_GE(out.changes.at(i).value, -1.0F);
+            EXPECT_LE(out.changes.at(i).value, 1.0F);
+        }
+    }
+}
+
+// Deterministic bit-mechanics check (incl. cross-byte packing): build a body with the
+// exact wire encoding, decode it, and assert the channels + values round-trip. This is
+// independent of any single capture and covers the full analog quantize<->dequantize loop.
+TEST(ActionInput, RoundTripsAnalogAndDigitalChannels) {
+    const auto quantize = [](float value) -> std::uint32_t {
+        if (value == 0.0F) {
+            return 0U;
+        }
+        const auto denom = static_cast<float>((1U << kActionAnalogValueBits) - 2U);
+        const float clamped =
+            std::clamp(value, kActionAnalogHigh - kActionAnalogRange, kActionAnalogHigh);
+        return static_cast<std::uint32_t>(((kActionAnalogHigh - clamped) * denom) /
+                                          kActionAnalogRange) +
+               1U;
+    };
+    struct Ch {
+        std::int32_t channel;
+        float value;
+    };
+    const std::array<Ch, 5> want{{{1, 0.75F}, {4, 1.0F}, {6, -0.25F}, {8, 0.0F}, {3, -1.0F}}};
+
+    wfh::proto::BitWriter writer;
+    writer.WriteByte(static_cast<std::uint8_t>(want.size()));  // count
+    writer.WriteI32(424242);                                   // timestamp
+    writer.WriteI32(0);                                        // seq
+    for (const Ch& entry : want) {
+        writer.WriteBits(static_cast<std::uint32_t>(entry.channel), kActionChannelIndexBits);
+        if (IsDigitalActionChannel(entry.channel)) {
+            writer.WriteBits(entry.value != 0.0F ? 1U : 0U, kActionDigitalValueBits);
+        } else {
+            writer.WriteBits(quantize(entry.value), kActionAnalogValueBits);
+        }
+    }
+    const std::vector<std::uint8_t> body = writer.Bytes();
+
+    const DecodedActions out = DecodeActionUpdate(body.data(), body.size());
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.timestamp, 424242);
+    ASSERT_EQ(out.changes.size(), want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        EXPECT_EQ(out.changes.at(i).channel, want.at(i).channel);
+        if (IsDigitalActionChannel(want.at(i).channel)) {
+            EXPECT_FLOAT_EQ(out.changes.at(i).value, want.at(i).value);
+        } else {
+            EXPECT_NEAR(out.changes.at(i).value, want.at(i).value, 0.001F);
+        }
+    }
+}
+
+TEST(ActionInput, RejectsTruncatedAndEmptyBodies) {
+    // count=1 but no change bytes -> fail closed.
+    const std::vector<std::uint8_t> truncated{0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00};
+    EXPECT_FALSE(DecodeActionUpdate(truncated.data(), truncated.size()).ok);
+    // Empty body.
+    EXPECT_FALSE(DecodeActionUpdate(nullptr, 0).ok);
+    EXPECT_FALSE(DecodeActionDump(nullptr, 0).ok);
+    // A dump that ends before all 21 channels are read.
+    const std::vector<std::uint8_t> short_dump{0x00, 0x00, 0x48, 0x32, 0x00, 0x00, 0x00, 0x00};
+    EXPECT_FALSE(DecodeActionDump(short_dump.data(), short_dump.size()).ok);
 }
 
 }  // namespace
