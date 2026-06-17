@@ -384,6 +384,27 @@ CTest**, `lint.ps1` = **PASS**.
   (`0x0A`/`0x09`) drives each tank from its player. Known refinement unchanged: altitude-hold while
   driving (tanks drift slowly in z; full off-map travel still descends).
 
+### ⟳ M6.2/M6.3 — live two-client test session + the real-time relay gap (2026-06-17)
+Ran a real **server + two rendering clients** end-to-end. Findings + fixes (all committed):
+- **Spectate crash root-caused + fixed (`7ebeae7`).** On reincarnate the server sent a TankSpawn for
+  an MVP-only tank that the engine-sourced relay never included → the client spawned a phantom that
+  never appeared in snapshots → "protocol mismatch" crash ~40s later + "no tank". Fix: spawn a REAL
+  engine tank per player (`SpawnPlayerTank` via a new `SetSpawnHandler` hook) and use its engine oid
+  as the TankSpawn id. Verified: both clients reincarnate into engine tanks (oid 9100/9101), relayed
+  (entities 37→39), survive past the crash window.
+- **Sync was "really low" → fixed (`cd6150d`).** The relay emitted only on visibility_changed
+  (~0.5 Hz). Now emits every tick (~10 Hz). Also spread player spawns (player_id-based x offset) so
+  two players don't overlap at the shared pad (camera-on-self hid the peer).
+- **CORE GAP (player-confirmed, the next milestone): in-game entity sync needs `UPDATE_ARRAY 0x0E`
+  (others) + `0x0F` (self) over UDP per-tick** (per the Wulf-Forge `player_sim_tick` reference). We
+  send `0x0F`-for-all over TCP, so clients render entities from the initial snapshot (the demo tanks)
+  but never get the `0x0E` "others" stream → can't see in-game players or interpolate. Key format
+  diff: `0x0F` leads with an i32 **ms-timestamp** then the sequence; `0x0E` writes only the sequence;
+  the rest is identical. Our `BuildViewUpdateSnapshot` is the `0x0F` shape but writes sequence for
+  BOTH i32 (should be `[ms-timestamp][sequence]`). **Full executable plan:**
+  `docs/superpowers/plans/2026-06-17-m6.3-update-array-udp-relay.md` (decided: implement fresh, not
+  rushed). Inbound golden ACTION captures: `tools/captures/action_packets_2026-06-17.txt`.
+
 ### ✅ M5.3 — team-select → entry-map → SPAWN works end-to-end; +2 follow-up fixes (2026-06-16)
 **Milestone: a real client can now pick a team, open the entry map, choose a repair pad, and spawn.**
 The blocker was a missing `UPDATE_STATS (0x1C)` on team switch — decoded from the user's own working
